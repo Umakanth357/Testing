@@ -35,25 +35,10 @@ log "Virtualenv created at $TOOL_DIR/venv"
 
 # ─── STEP 3: Core Python dependencies ───────────────────────
 step "3/9 Python dependencies"
-pip install -q \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 \
-    gradio==4.44.0 \
-    numpy opencv-python-headless \
-    scipy soundfile librosa \
-    yt-dlp \
-    openai-whisper \
-    requests httpx \
-    Pillow \
-    facenet-pytorch \
-    gfpgan \
-    basicsr \
-    realesrgan \
-    imageio imageio-ffmpeg \
-    tqdm \
-    pydub \
-    transformers accelerate \
-    langchain-community \
-    ollama
+# Install PyTorch with CUDA 11.8 first (must precede requirements.txt)
+pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Install all remaining dependencies from requirements.txt
+pip install -q -r "$TOOL_DIR/requirements.txt"
 log "Python dependencies installed"
 
 # ─── STEP 4: Clone core model repos ─────────────────────────
@@ -146,11 +131,13 @@ server {
     }
 
     location /outputs/ {
-        alias /home/ubuntu/avatar_tool/outputs/;
+        alias TOOL_DIR_PLACEHOLDER/outputs/;
         add_header Content-Disposition "attachment";
     }
 }
 NGINX
+# Replace placeholder with actual tool directory path
+sudo sed -i "s|TOOL_DIR_PLACEHOLDER|$TOOL_DIR|g" /etc/nginx/sites-available/avatar_tool
 sudo ln -sf /etc/nginx/sites-available/avatar_tool /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl restart nginx

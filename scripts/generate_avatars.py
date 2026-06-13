@@ -107,12 +107,14 @@ def generate_with_diffusers():
             is_flux = False
 
         if pipe is None:
-            # RealVisXL on SD — works on 6GB
-            logger.info("Loading RealVisXL (SD-based) pipeline...")
-            pipe = StableDiffusionPipeline.from_pretrained(
+            # RealVisXL_V4.0 is an SDXL model — must use StableDiffusionXLPipeline
+            logger.info("Loading RealVisXL (SDXL-based) pipeline...")
+            from diffusers import StableDiffusionXLPipeline
+            pipe = StableDiffusionXLPipeline.from_pretrained(
                 "SG161222/RealVisXL_V4.0",
                 torch_dtype=torch.float16,
-                safety_checker=None,
+                use_safetensors=True,
+                variant="fp16",
             ).to(device)
             pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
             pipe.enable_attention_slicing()

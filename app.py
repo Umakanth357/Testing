@@ -392,14 +392,29 @@ def build_ui():
                 def save_script_file(script_text):
                     if not script_text:
                         return None
-                    path = str(OUTPUTS / f"script_{uuid.uuid4()[:8]}.txt")
+                    path = str(OUTPUTS / f"script_{str(uuid.uuid4())[:8]}.txt")
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(script_text)
                     return path
 
                 # ── Wire generate button ─────────────────────────────
+                def generate_and_save(
+                    source_type, script_input, yt_url, raw_text,
+                    content_type, voice_profile, avatar_choice, background,
+                    language, tone, target_duration, add_captions,
+                    progress=gr.Progress()
+                ):
+                    status, script, video, script_text = generate_video_job(
+                        source_type, script_input, yt_url, raw_text,
+                        content_type, voice_profile, avatar_choice, background,
+                        language, tone, target_duration, add_captions,
+                        progress=progress
+                    )
+                    script_file = save_script_file(script_text)
+                    return status, script, video, script_file
+
                 generate_btn.click(
-                    fn=generate_video_job,
+                    fn=generate_and_save,
                     inputs=[
                         source_type, script_input, yt_url, raw_text,
                         content_type, voice_profile, avatar_choice, background,

@@ -140,9 +140,14 @@ class VideoPipeline:
         base_vids = list(ASSETS.glob("base_driving_*.mp4")) if ASSETS.exists() else []
         if base_vids:
             return str(base_vids[0])
-        # Generate a 10-second neutral face loop as driving video
-        # In production: use a 10-15 sec recording of any person looking at camera
-        return str(AVATARS / "base_driving.mp4") if (AVATARS / "base_driving.mp4").exists() else ""
+        fallback = AVATARS / "base_driving.mp4"
+        if fallback.exists():
+            return str(fallback)
+        # No driving video found — LivePortrait will fail and cascade to SadTalker
+        logger.warning("No base driving video found in web/assets/ or avatars/. "
+                       "Place a 10-15s neutral face video as web/assets/base_driving_neutral.mp4 "
+                       "to enable LivePortrait animation.")
+        return ""
 
     # ─── Stage 1b: SadTalker (fallback) ─────────────────────────
     def _run_sadtalker(self, avatar_img: str, audio: str, tmpdir: str, job_id: str) -> Optional[str]:
@@ -268,6 +273,8 @@ print('GFPGAN done')
             ], capture_output=True, text=True, timeout=600)
 
             enhanced_count = len(list(Path(enhanced_dir).glob("*.png")))
+            if enhanced_count == 0:
+                logger.warning(f"[{job_id}] GFPGAN produced 0 enhanced frames — check gfpgan/cv2 installation")
             if enhanced_count == 0:
                 return None
 
