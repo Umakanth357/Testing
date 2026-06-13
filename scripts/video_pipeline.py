@@ -1,11 +1,14 @@
 """
 video_pipeline.py
 Full avatar video generation:
-  1. LivePortrait  — drives expressions + head movement from base video
-  2. MuseTalk      — frame-perfect lip sync (diffusion-based)
-  3. GFPGAN        — face restoration + 4x upscale
-  4. ffmpeg        — compose avatar on background + captions + logo
-Fallback: SadTalker if MuseTalk/LivePortrait unavailable
+  1. Hallo4        — audio-driven head + expression + upper body animation (SIGGRAPH 2025)
+     Fallback 1a: LivePortrait — head movement from driving video
+     Fallback 1b: SadTalker   — audio-driven talking head
+     Fallback 1c: Static loop — avatar image looped for audio duration
+  2. LatentSync v1.5 — audio-conditioned latent diffusion lip sync (ByteDance, 8GB VRAM)
+     Fallback 2:  MuseTalk    — face-region lip sync (256x256)
+  3. GFPGAN        — face restoration + 2x upscale
+  4. ffmpeg        — compose avatar on background + captions
 """
 import os
 import sys
@@ -19,14 +22,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ROOT       = Path(__file__).parent.parent
-WEIGHTS    = ROOT / "models" / "weights"
-MUSETALK   = ROOT / "models" / "MuseTalk"
-LIVEPORT   = ROOT / "models" / "LivePortrait"
-SADTALKER  = ROOT / "models" / "SadTalker"
-AVATARS    = ROOT / "avatars"
-OUTPUTS    = ROOT / "outputs"
-ASSETS     = ROOT / "web" / "assets"
+ROOT         = Path(__file__).parent.parent
+WEIGHTS      = ROOT / "models" / "weights"
+HALLO4       = ROOT / "models" / "Hallo4"
+LATENTSYNC   = ROOT / "models" / "LatentSync"
+MUSETALK     = ROOT / "models" / "MuseTalk"
+LIVEPORT     = ROOT / "models" / "LivePortrait"
+SADTALKER    = ROOT / "models" / "SadTalker"
+AVATARS      = ROOT / "avatars"
+OUTPUTS      = ROOT / "outputs"
+ASSETS       = ROOT / "web" / "assets"
 
 OUTPUTS.mkdir(exist_ok=True)
 
@@ -55,9 +60,12 @@ class VideoPipeline:
         tmpdir = tempfile.mkdtemp(prefix=f"vidgen_{job_id}_")
 
         try:
-            # Stage 1: LivePortrait (expressions + head motion)
-            logger.info(f"[{job_id}] Stage 1: LivePortrait animation")
-            animated = self._run_liveportrait(avatar_image, audio_path, tmpdir, job_id)
+            # Stage 1: Hallo4 — audio-driven expression + head + upper body
+            logger.info(f"[{job_id}] Stage 1: Hallo4 animation")
+            animated = self._run_hallo4(avatar_image, audio_path, tmpdir, job_id)
+            if not animated:
+                logger.warning(f"[{job_id}] Hallo4 failed — trying LivePortrait fallback")
+                animated = self._run_liveportrait(avatar_image, audio_path, tmpdir, job_id)
             if not animated:
                 logger.warning(f"[{job_id}] LivePortrait failed — trying SadTalker fallback")
                 animated = self._run_sadtalker(avatar_image, audio_path, tmpdir, job_id)
@@ -65,11 +73,14 @@ class VideoPipeline:
                 logger.warning(f"[{job_id}] SadTalker failed — using static avatar fallback")
                 animated = self._static_avatar_fallback(avatar_image, audio_path, tmpdir, job_id)
 
-            # Stage 2: MuseTalk (lip sync on top of LivePortrait output)
-            logger.info(f"[{job_id}] Stage 2: MuseTalk lip sync")
-            lip_synced = self._run_musetalk(animated, audio_path, tmpdir, job_id)
+            # Stage 2: LatentSync v1.5 lip sync (8GB VRAM, language-agnostic)
+            logger.info(f"[{job_id}] Stage 2: LatentSync lip sync")
+            lip_synced = self._run_latentsync(animated, audio_path, tmpdir, job_id)
             if not lip_synced:
-                logger.warning(f"[{job_id}] MuseTalk failed — using LivePortrait output directly")
+                logger.warning(f"[{job_id}] LatentSync failed — trying MuseTalk fallback")
+                lip_synced = self._run_musetalk(animated, audio_path, tmpdir, job_id)
+            if not lip_synced:
+                logger.warning(f"[{job_id}] MuseTalk failed — using animation output directly")
                 lip_synced = animated
 
             # Stage 3: GFPGAN face restoration + upscale
@@ -193,7 +204,77 @@ class VideoPipeline:
         ], check=True)
         return out
 
-    # ─── Stage 2: MuseTalk ───────────────────────────────────────
+    # ─── Stage 1: Hallo4 ────────────────────────────────────────
+    def _run_hallo4(self, avatar_img: str, audio: str, tmpdir: str, job_id: str) -> Optional[str]:
+        """
+        Hallo4 (SIGGRAPH Asia 2025) — audio-driven head + expression + upper body.
+        No driving video needed. Derives natural expressions directly from audio.
+        Repo: https://github.com/fudan-generative-vision/hallo
+        """
+        out = os.path.join(tmpdir, "hallo4_out.mp4")
+        try:
+            if not HALLO4.exists():
+                return None
+            cmd = [
+                sys.executable,
+                str(HALLO4 / "scripts" / "inference.py"),
+                "--source_image", avatar_img,
+                "--driving_audio", audio,
+                "--output", out,
+                "--pose_weight", "1.0",
+                "--face_weight", "1.0",
+                "--lip_weight", "1.0",
+                "--face_expand_ratio", "1.2",
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600, cwd=str(HALLO4)
+            )
+            if result.returncode == 0 and Path(out).exists():
+                return out
+            logger.debug(f"Hallo4 stderr: {result.stderr[-500:]}")
+            return None
+        except Exception as e:
+            logger.debug(f"Hallo4 error: {e}")
+            return None
+
+    # ─── Stage 2: LatentSync ─────────────────────────────────────
+    def _run_latentsync(self, video_in: str, audio: str, tmpdir: str, job_id: str) -> Optional[str]:
+        """
+        LatentSync v1.5 (ByteDance) — audio-conditioned latent diffusion lip sync.
+        Language-agnostic (Whisper embeddings). Requires 8GB VRAM — T4 compatible.
+        Repo: https://github.com/bytedance/LatentSync
+        """
+        out = os.path.join(tmpdir, "latentsync_out.mp4")
+        try:
+            if not LATENTSYNC.exists():
+                return None
+            inference_script = LATENTSYNC / "scripts" / "inference.py"
+            if not inference_script.exists():
+                inference_script = LATENTSYNC / "inference.py"
+            if not inference_script.exists():
+                return None
+            cmd = [
+                sys.executable, str(inference_script),
+                "--unet_config_path", str(LATENTSYNC / "configs" / "unet" / "second_stage.yaml"),
+                "--inference_ckpt_path", str(WEIGHTS / "latentsync" / "latentsync_unet.pt"),
+                "--video_path", video_in,
+                "--audio_path", audio,
+                "--video_out_path", out,
+                "--guidance_scale", "2.0",
+                "--seed", "1247",
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600, cwd=str(LATENTSYNC)
+            )
+            if result.returncode == 0 and Path(out).exists():
+                return out
+            logger.debug(f"LatentSync stderr: {result.stderr[-500:]}")
+            return None
+        except Exception as e:
+            logger.debug(f"LatentSync error: {e}")
+            return None
+
+    # ─── Stage 2c: MuseTalk (fallback lip sync) ──────────────────
     def _run_musetalk(self, video_in: str, audio: str, tmpdir: str, job_id: str) -> Optional[str]:
         out = os.path.join(tmpdir, "musetalk_out.mp4")
         try:

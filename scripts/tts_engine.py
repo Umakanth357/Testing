@@ -1,10 +1,14 @@
 """
 tts_engine.py
 Generates audio from tagged script segments.
-Primary EN  : Chatterbox TTS (MIT, emotion exaggeration dial)
-Primary TE/IN: Svara TTS v1 (Apache 2.0, 19 Indic languages)
-Fallback EN : Coqui TTS (Mozilla Public License)
-Fallback TE : AI4Bharat Indic-TTS (MIT)
+Primary EN    : Chatterbox TTS (MIT) — voice cloning via audio_prompt
+Primary TE/IN : IndicF5 by AI4Bharat — 11 Indic languages, zero-shot voice cloning
+Fallback IN   : Svara TTS v1 (Apache 2.0)
+Fallback IN   : AI4Bharat HuggingFace API
+Fallback ALL  : gTTS (last resort)
+
+Voice cloning: place a 10-30s WAV reference in models/voices/<voice_id>.wav
+               The engine will automatically use it for that voice profile.
 """
 import os
 import sys
@@ -16,31 +20,100 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).parent.parent
+ROOT        = Path(__file__).parent.parent
 WEIGHTS_DIR = ROOT / "models" / "weights"
+VOICES_DIR  = ROOT / "models" / "voices"   # drop <voice_id>.wav here for cloning
+VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Voice profile definitions ─────────────────────────────────────
 VOICE_PROFILES = {
     # Telugu
-    "te_female": {"lang": "te", "gender": "female", "engine": "svara", "voice_id": "te_female"},
-    "te_male":   {"lang": "te", "gender": "male",   "engine": "svara", "voice_id": "te_male"},
+    "te_female": {"lang": "te", "gender": "female", "engine": "indic", "voice_id": "te_female"},
+    "te_male":   {"lang": "te", "gender": "male",   "engine": "indic", "voice_id": "te_male"},
     # Kannada
-    "kn_female": {"lang": "kn", "gender": "female", "engine": "svara", "voice_id": "kn_female"},
-    "kn_male":   {"lang": "kn", "gender": "male",   "engine": "svara", "voice_id": "kn_male"},
+    "kn_female": {"lang": "kn", "gender": "female", "engine": "indic", "voice_id": "kn_female"},
+    "kn_male":   {"lang": "kn", "gender": "male",   "engine": "indic", "voice_id": "kn_male"},
     # Tamil
-    "ta_female": {"lang": "ta", "gender": "female", "engine": "svara", "voice_id": "ta_female"},
-    "ta_male":   {"lang": "ta", "gender": "male",   "engine": "svara", "voice_id": "ta_male"},
+    "ta_female": {"lang": "ta", "gender": "female", "engine": "indic", "voice_id": "ta_female"},
+    "ta_male":   {"lang": "ta", "gender": "male",   "engine": "indic", "voice_id": "ta_male"},
     # Hindi
-    "hi_female": {"lang": "hi", "gender": "female", "engine": "svara", "voice_id": "hi_female"},
-    "hi_male":   {"lang": "hi", "gender": "male",   "engine": "svara", "voice_id": "hi_male"},
+    "hi_female": {"lang": "hi", "gender": "female", "engine": "indic", "voice_id": "hi_female"},
+    "hi_male":   {"lang": "hi", "gender": "male",   "engine": "indic", "voice_id": "hi_male"},
     # English
     "en_female": {"lang": "en", "gender": "female", "engine": "chatterbox", "voice_id": "en_female"},
     "en_male":   {"lang": "en", "gender": "male",   "engine": "chatterbox", "voice_id": "en_male"},
 }
 
 
+class IndicF5TTS:
+    """
+    IndicF5 by AI4Bharat — best open-source Indic TTS as of 2025.
+    Supports 11 languages: Telugu, Tamil, Kannada, Hindi, Malayalam + more.
+    Zero-shot voice cloning: place reference WAV at models/voices/<voice_id>.wav
+    NOTE: Verify license at huggingface.co/ai4bharat/IndicF5 before production use.
+    """
+
+    LANG_CODES = {
+        "te": "Telugu", "ta": "Tamil", "kn": "Kannada",
+        "hi": "Hindi",  "ml": "Malayalam", "mr": "Marathi",
+        "bn": "Bengali","gu": "Gujarati",  "pa": "Punjabi",
+        "or": "Odia",   "as": "Assamese",
+    }
+
+    def __init__(self):
+        self._model     = None
+        self._available = False
+        self._try_load()
+
+    def _try_load(self):
+        try:
+            from transformers import pipeline as hf_pipeline
+            self._pipe = hf_pipeline(
+                "text-to-speech",
+                model="ai4bharat/IndicF5",
+                device=0 if self._cuda() else -1,
+            )
+            self._available = True
+            logger.info("IndicF5 TTS loaded successfully")
+        except Exception as e:
+            logger.warning(f"IndicF5 unavailable: {e}. Will use Svara/AI4Bharat-API fallback.")
+
+    def _cuda(self):
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def synthesize(self, text: str, lang: str, voice_id: str, output_path: str) -> bool:
+        if not self._available:
+            return False
+        try:
+            lang_name  = self.LANG_CODES.get(lang, "Hindi")
+            ref_audio  = VOICES_DIR / f"{voice_id}.wav"
+            inputs     = {"text": text, "language": lang_name}
+            if ref_audio.exists():
+                inputs["reference_audio"] = str(ref_audio)
+                logger.debug(f"IndicF5 using voice clone: {ref_audio.name}")
+
+            output = self._pipe(**inputs)
+            import soundfile as sf
+            import numpy as np
+            audio_array = np.array(output["audio"])
+            if audio_array.ndim == 1:
+                audio_array = audio_array[np.newaxis, :]
+            sf.write(output_path, audio_array.T, output["sampling_rate"])
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+        except Exception as e:
+            logger.error(f"IndicF5 synthesis error: {e}")
+            return False
+
+
 class SvaraTTS:
-    """Svara TTS — 19 Indian languages, emotion tags, MIT license."""
+    """Svara TTS — fallback for Indic when IndicF5 unavailable."""
 
     def __init__(self):
         self._model = None
@@ -144,12 +217,23 @@ class ChatterboxTTS:
     def is_available(self) -> bool:
         return self._available
 
-    def synthesize(self, text: str, exaggeration: float, output_path: str) -> bool:
+    def synthesize(self, text: str, exaggeration: float, output_path: str,
+                   voice_id: str = "en_female") -> bool:
         if not self._available:
             return False
         try:
             import torchaudio
-            wav = self._model.generate(text, exaggeration=exaggeration)
+            ref_audio = VOICES_DIR / f"{voice_id}.wav"
+            if ref_audio.exists():
+                # Voice cloning — speak in the reference person's voice
+                wav = self._model.generate(
+                    text,
+                    audio_prompt_path=str(ref_audio),
+                    exaggeration=exaggeration
+                )
+                logger.debug(f"Chatterbox voice clone: {ref_audio.name}")
+            else:
+                wav = self._model.generate(text, exaggeration=exaggeration)
             torchaudio.save(output_path, wav, self._model.sr)
             return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
         except Exception as e:
@@ -198,16 +282,18 @@ class TTSEngine:
 
     def __init__(self):
         logger.info("Initialising TTS engines...")
-        self.svara     = SvaraTTS()
+        self.indicf5    = IndicF5TTS()
+        self.svara      = SvaraTTS()
         self.chatterbox = ChatterboxTTS()
-        self.coqui     = CoquiTTS()
+        self.coqui      = CoquiTTS()
         self._log_availability()
 
     def _log_availability(self):
         avail = []
-        if self.svara.is_available():     avail.append("Svara (Indic)")
+        if self.indicf5.is_available():    avail.append("IndicF5 (Indic primary)")
+        if self.svara.is_available():      avail.append("Svara (Indic fallback)")
         if self.chatterbox.is_available(): avail.append("Chatterbox (EN)")
-        if self.coqui.is_available():     avail.append("Coqui (EN fallback)")
+        if self.coqui.is_available():      avail.append("Coqui (EN fallback)")
         if not avail:
             logger.error("NO TTS ENGINES AVAILABLE — check installation")
         else:
@@ -239,21 +325,21 @@ class TTSEngine:
 
             success = False
 
-            # ── Indic languages → Svara ──────────────────────
+            # ── Indic languages → IndicF5 → Svara → API → gTTS ──
             if lang != "en":
-                if self.svara.is_available():
+                if self.indicf5.is_available():
+                    success = self.indicf5.synthesize(text, lang, voice_id, seg_path)
+                if not success and self.svara.is_available():
                     success = self.svara.synthesize(text, voice_id, emotion, seg_path)
                 if not success:
-                    # AI4Bharat fallback for Indic
                     success = self._ai4bharat_fallback(text, lang, seg_path)
                 if not success:
-                    # Last resort: gTTS (requires internet)
                     success = self._gtts_fallback(text, lang, seg_path)
 
-            # ── English → Chatterbox ─────────────────────────
+            # ── English → Chatterbox (with voice clone) → Coqui → gTTS ──
             else:
                 if self.chatterbox.is_available():
-                    success = self.chatterbox.synthesize(text, exagg, seg_path)
+                    success = self.chatterbox.synthesize(text, exagg, seg_path, voice_id)
                 if not success and self.coqui.is_available():
                     success = self.coqui.synthesize(text, seg_path)
                 if not success:

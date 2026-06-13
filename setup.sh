@@ -72,17 +72,53 @@ else
     warn "SadTalker already exists, skipping"
 fi
 
-# Svara TTS (Indic languages incl. Telugu)
+# Hallo4 — audio-driven expression + head + body animation (SIGGRAPH Asia 2025)
+if [ ! -d "models/Hallo4" ]; then
+    git clone https://github.com/fudan-generative-vision/hallo.git models/Hallo4 -q
+    pip install -q -r models/Hallo4/requirements.txt 2>/dev/null || true
+    log "Hallo4 cloned"
+else
+    warn "Hallo4 already exists, skipping"
+fi
+
+# LatentSync v1.5 — latent diffusion lip sync, 8GB VRAM, language-agnostic (ByteDance)
+if [ ! -d "models/LatentSync" ]; then
+    git clone https://github.com/bytedance/LatentSync.git models/LatentSync -q
+    pip install -q -r models/LatentSync/requirements.txt 2>/dev/null || true
+    log "LatentSync cloned"
+else
+    warn "LatentSync already exists, skipping"
+fi
+
+# IndicF5 — best Indic TTS, 11 languages, zero-shot voice cloning (AI4Bharat)
+# NOTE: Verify license at huggingface.co/ai4bharat/IndicF5 before production deployment
+pip install -q soundfile numpy 2>/dev/null || true
+python3 -c "
+from transformers import pipeline
+print('Pre-downloading IndicF5 model weights...')
+try:
+    pipeline('text-to-speech', model='ai4bharat/IndicF5')
+    print('IndicF5 ready')
+except Exception as e:
+    print(f'IndicF5 pre-download failed (will load on first use): {e}')
+" || warn "IndicF5 pre-download failed — will attempt on first run"
+
+# Svara TTS (Indic fallback)
 pip install -q svara-tts 2>/dev/null || \
     pip install -q git+https://github.com/Kenpath/svara-tts-inference.git 2>/dev/null || \
-    warn "Svara TTS pip install failed — will use HuggingFace inference"
+    warn "Svara TTS pip install failed — IndicF5 is primary Indic TTS"
 
-# Chatterbox TTS (English)
+# Chatterbox TTS (English, voice cloning)
 pip install -q chatterbox-tts 2>/dev/null || \
     warn "Chatterbox pip install failed — will use Coqui fallback"
 
 # Coqui TTS (fallback English TTS)
 pip install -q TTS 2>/dev/null || warn "Coqui TTS install failed"
+
+# Create voice cloning directory — drop <voice_id>.wav files here
+mkdir -p "$TOOL_DIR/models/voices"
+log "Voice cloning directory ready: $TOOL_DIR/models/voices/"
+log "  → Drop te_female.wav, en_male.wav etc. here to enable voice cloning"
 
 log "All model repos cloned"
 

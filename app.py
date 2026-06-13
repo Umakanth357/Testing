@@ -175,7 +175,7 @@ def generate_video_job(
             return "❌ No avatar images found. Run setup.sh to generate avatars.", final_script, None, final_script
 
         # ── Step 5: Video generation ───────────────────────────
-        progress(0.55, desc="🎬 Animating avatar (LivePortrait + MuseTalk)...")
+        progress(0.55, desc="🎬 Animating avatar (Hallo4 + LatentSync)...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = str(OUTPUTS / f"video_{timestamp}_{job_id}.mp4")
 
@@ -185,7 +185,7 @@ def generate_video_job(
             output_path=output_path,
             background=background.lower(),
             add_captions=add_captions,
-            logo_path=str(ROOT / "web" / "assets" / "logo.png") if (ROOT / "web" / "assets" / "logo.png").exists() else None,
+            logo_path=None,
             job_id=job_id
         )
 
