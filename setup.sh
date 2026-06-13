@@ -113,6 +113,24 @@ step "7/9 Generate default South Indian avatars"
 python3 "$TOOL_DIR/scripts/generate_avatars.py"
 log "Default avatars generated"
 
+# Generate base driving video for LivePortrait (required for head animation)
+# Uses the first available avatar as a 10-second still loop — good enough for LivePortrait motion transfer
+DRIVING_VIDEO="$TOOL_DIR/web/assets/base_driving_neutral.mp4"
+if [ ! -f "$DRIVING_VIDEO" ]; then
+    mkdir -p "$TOOL_DIR/web/assets"
+    FIRST_AVATAR=$(ls "$TOOL_DIR/avatars/"*.png 2>/dev/null | head -1)
+    if [ -n "$FIRST_AVATAR" ]; then
+        ffmpeg -loop 1 -i "$FIRST_AVATAR" \
+            -c:v libx264 -tune stillimage -pix_fmt yuv420p \
+            -t 10 -r 25 "$DRIVING_VIDEO" -y -loglevel error
+        log "Base driving video created: $DRIVING_VIDEO"
+    else
+        warn "No avatar PNG found — base driving video not created. LivePortrait will use SadTalker fallback."
+    fi
+else
+    warn "Base driving video already exists, skipping"
+fi
+
 # ─── STEP 8: Nginx config ───────────────────────────────────
 step "8/9 Configure Nginx"
 sudo tee /etc/nginx/sites-available/avatar_tool > /dev/null <<'NGINX'

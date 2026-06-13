@@ -17,6 +17,13 @@ from datetime import datetime
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
+# Load .env file if present (GROQ_API_KEY, HF_TOKEN etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
 import gradio as gr
 from emotion_tagger import tag_script, build_tagged_script
 from tts_engine import TTSEngine, VOICE_PROFILES
