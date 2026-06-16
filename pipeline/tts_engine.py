@@ -69,7 +69,11 @@ def synthesize(text: str, voice_profile: str, out_path: Path,
         success = False
 
         if engine == "indic":
-            success = _synth_indic(seg, lang, seg_path, ref_audio)
+            # Indic Parler-TTS first (emotion + pitch + speed control, 1806h training)
+            success = _synth_parler(seg, lang, seg_path, profile)
+            if not success:
+                # IndicF5 fallback (1417h, voice cloning, no style params)
+                success = _synth_indic(seg, lang, seg_path, ref_audio)
             if not success:
                 success = _synth_coqui(seg, lang, seg_path, ref_audio)
             if not success:
@@ -148,7 +152,95 @@ def _split_into_segments(text: str) -> list[str]:
     return segments
 
 
-# ── IndicF5 ───────────────────────────────────────────────────────────────────
+# ── Indic Parler-TTS (Primary for Indic languages) ───────────────────────────
+# Research confirmed: 1,806h training, 6 controllable params (Pitch, Speed,
+# Expressivity, Voice Quality, Reverb, Background Noise), 69 voices.
+# Superior to IndicF5 for emotion-expressive content.
+
+_parler_model     = None
+_parler_tokenizer = None
+
+# Character-specific voice descriptions for Indic Parler-TTS
+PARLER_VOICE_DESCRIPTIONS = {
+    "kavya": (
+        "Kavya speaks with a warm, medium-pitched Telugu female voice. "
+        "Her delivery is medium-fast with high expressivity and natural prosody. "
+        "Voice quality is clear and smooth. Background noise is minimal. "
+        "Reverberation is slight, like a well-treated recording studio."
+    ),
+    "arjun": (
+        "Arjun speaks with a deep baritone Telugu male voice. "
+        "His delivery is deliberate and measured with controlled expressivity. "
+        "Voice quality is authoritative and clear. Background noise is none. "
+        "Reverberation is minimal, like a professional broadcast studio."
+    ),
+    "default": (
+        "The speaker has a clear, natural Indian voice with neutral expressivity. "
+        "Delivery is medium pace. Voice quality is clean. No background noise."
+    ),
+}
+
+
+def _synth_parler(text: str, lang: str, out_path: Path, profile: dict) -> bool:
+    """
+    Indic Parler-TTS synthesis with character-specific voice description.
+    Supports Telugu, Hindi, Kannada, Tamil, and 17 more Indic languages.
+    """
+    global _parler_model, _parler_tokenizer
+    try:
+        from transformers import AutoTokenizer, AutoModelForTextToSpeech
+        import torch, soundfile as sf
+
+        if _parler_model is None:
+            log.info("Loading Indic Parler-TTS (primary Indic TTS)...")
+            model_id = "ai4bharat/indic-parler-tts"
+            _parler_tokenizer = AutoTokenizer.from_pretrained(model_id)
+            _parler_model     = AutoModelForTextToSpeech.from_pretrained(
+                model_id, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
+            )
+            if DEVICE == "cuda":
+                _parler_model = _parler_model.cuda()
+            _parler_model.eval()
+            log.info("Indic Parler-TTS loaded.")
+
+        # Get character voice description from profile (falls back to default)
+        char_id      = profile.get("character_id", "default")
+        description  = PARLER_VOICE_DESCRIPTIONS.get(char_id, PARLER_VOICE_DESCRIPTIONS["default"])
+
+        # Add language cue
+        lang_name_map = {"te": "Telugu", "hi": "Hindi", "kn": "Kannada",
+                         "ta": "Tamil", "ml": "Malayalam", "mr": "Marathi"}
+        lang_name = lang_name_map.get(lang, "Telugu")
+        description = f"[{lang_name}] " + description
+
+        with torch.no_grad():
+            desc_inputs  = _parler_tokenizer(description, return_tensors="pt")
+            text_inputs  = _parler_tokenizer(text, return_tensors="pt")
+
+            if DEVICE == "cuda":
+                desc_inputs  = {k: v.cuda() for k, v in desc_inputs.items()}
+                text_inputs  = {k: v.cuda() for k, v in text_inputs.items()}
+
+            generation = _parler_model.generate(
+                input_ids           = desc_inputs["input_ids"],
+                prompt_input_ids    = text_inputs["input_ids"],
+                attention_mask      = desc_inputs.get("attention_mask"),
+                prompt_attention_mask = text_inputs.get("attention_mask"),
+            )
+
+        audio_arr = generation.cpu().numpy().squeeze()
+        sr = _parler_model.config.sampling_rate if hasattr(_parler_model.config, "sampling_rate") else 44100
+        sf.write(str(out_path), audio_arr, sr)
+        return True
+
+    except Exception as e:
+        log.warning(f"Indic Parler-TTS failed: {e}")
+        _parler_model     = None
+        _parler_tokenizer = None
+        return False
+
+
+# ── IndicF5 (Fallback) ────────────────────────────────────────────────────────
 
 _indic_pipeline = None
 

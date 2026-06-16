@@ -17,6 +17,8 @@ realesrgan>=0.3.0
 facexlib>=0.3.0
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
+# Indic Parler-TTS: primary Indic TTS (6 emotion params, 69 voices, 1806h training)
+# Downloaded via transformers — no separate pip package needed (uses HF hub)
 chatterbox-tts>=0.1.0
 TTS>=0.22.0
 gtts>=2.5.0

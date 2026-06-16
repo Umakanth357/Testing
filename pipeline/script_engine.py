@@ -163,7 +163,16 @@ def generate_script(facts: list[str], language: str, format_type: str,
         kavya_pos  = (debate_positions or {}).get("kavya", "in favour")
         arjun_pos  = (debate_positions or {}).get("arjun", "against")
         char_block = build_debate_system_prompt(topic, kavya_pos, arjun_pos)
-        speaker_rule = "- Mark each speaker as KAVYA: or ARJUN: before every line"
+        # ID-RAG style identity grounding — research confirmed LLMs drift toward
+        # social conformity without this. Each character must maintain position.
+        speaker_rule = (
+            "- Mark each speaker as KAVYA: or ARJUN: before every line\n"
+            "- KAVYA must maintain her position throughout even if Arjun makes good points\n"
+            "- ARJUN must maintain his position throughout even if Kavya makes good points\n"
+            "- Characters can acknowledge a point without changing their stance\n"
+            "- They must NOT agree with each other by the end — partial mutual acknowledgment only\n"
+            "- If a character starts drifting to the other's position, reset them with internal conviction"
+        )
     else:
         char_block  = build_character_system_prompt(character_id, topic, format_type)
         speaker_rule = ""

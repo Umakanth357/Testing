@@ -50,7 +50,8 @@ OLLAMA_MODEL     = "gemma3:4b"
 OLLAMA_URL       = "http://localhost:11434"
 OLLAMA_TIMEOUT   = 120
 
-INDIC_TTS_MODEL  = "ai4bharat/IndicF5"
+INDIC_TTS_MODEL        = "ai4bharat/IndicF5"           # Fallback: 11 languages, voice cloning
+INDIC_PARLER_TTS_MODEL = "ai4bharat/indic-parler-tts"  # Primary: 6 emotion params, 69 voices, 1806h
 REALESRGAN_MODEL = "RealESRGAN_x4plus"
 
 # ── Output ────────────────────────────────────────────────────────────────────
@@ -157,13 +158,21 @@ ATTIRE_PROMPTS = {
 
 # ── Voice Profiles ────────────────────────────────────────────────────────────
 VOICE_PROFILES = {
-    "te_female_professional": {"engine": "indic", "lang": "te", "gender": "female", "speed": 1.0, "pitch": 1.0},
-    "te_male_professional":   {"engine": "indic", "lang": "te", "gender": "male",   "speed": 1.0, "pitch": 0.9},
-    "kn_female_professional": {"engine": "indic", "lang": "kn", "gender": "female", "speed": 1.0, "pitch": 1.0},
-    "ta_male_professional":   {"engine": "indic", "lang": "ta", "gender": "male",   "speed": 1.0, "pitch": 0.9},
-    "hi_female_professional": {"engine": "indic", "lang": "hi", "gender": "female", "speed": 1.0, "pitch": 1.0},
-    "en_male_professional":   {"engine": "chatterbox", "lang": "en", "gender": "male",   "speed": 1.0, "pitch": 0.9},
-    "en_female_professional": {"engine": "chatterbox", "lang": "en", "gender": "female", "speed": 1.0, "pitch": 1.0},
+    # Primary: Indic Parler-TTS (emotion-expressive), fallback: IndicF5
+    "te_female_professional": {"engine": "indic", "lang": "te", "gender": "female", "character_id": "kavya",
+                               "speed": 1.0, "pitch": 1.0, "expressivity": "high"},
+    "te_male_professional":   {"engine": "indic", "lang": "te", "gender": "male",   "character_id": "arjun",
+                               "speed": 0.9, "pitch": 0.85, "expressivity": "medium"},
+    "kn_female_professional": {"engine": "indic", "lang": "kn", "gender": "female", "character_id": "default",
+                               "speed": 1.0, "pitch": 1.0, "expressivity": "medium"},
+    "ta_male_professional":   {"engine": "indic", "lang": "ta", "gender": "male",   "character_id": "default",
+                               "speed": 0.95, "pitch": 0.9, "expressivity": "medium"},
+    "hi_female_professional": {"engine": "indic", "lang": "hi", "gender": "female", "character_id": "default",
+                               "speed": 1.0, "pitch": 1.0, "expressivity": "medium"},
+    "en_male_professional":   {"engine": "chatterbox", "lang": "en", "gender": "male",   "character_id": "default",
+                               "speed": 1.0, "pitch": 0.9},
+    "en_female_professional": {"engine": "chatterbox", "lang": "en", "gender": "female", "character_id": "default",
+                               "speed": 1.0, "pitch": 1.0},
 }
 
 # ── Languages ─────────────────────────────────────────────────────────────────
