@@ -28,14 +28,24 @@ from config import (
     OUTPUTS_DIR, AVATARS_DIR, SCENES, AVATARS, LANGUAGES,
     VIDEO_FORMATS, VOICE_PROFILES, BACKGROUNDS_DIR,
 )
-from pipeline.script_engine  import process_content
-from pipeline.tts_engine     import synthesize, add_room_acoustics
-from pipeline.animation_engine import animate, generate_walk_entrance
-from pipeline.lipsync_engine import apply_lipsync
-from pipeline.compose_engine import (
+from pipeline.script_engine      import process_content
+from pipeline.tts_engine         import synthesize, add_room_acoustics
+from pipeline.animation_engine   import animate, generate_walk_entrance
+from pipeline.lipsync_engine     import apply_lipsync
+from pipeline.compose_engine     import (
     compose_video, compose_debate, stitch_scene_segments,
 )
-from pipeline.avatar_engine  import get_avatar_path, list_available_avatars
+from pipeline.avatar_engine      import get_avatar_path, list_available_avatars
+from pipeline.character_bible    import (
+    CHARACTERS, get_tts_config, get_avatar_key, who_leads_topic
+)
+from pipeline.catchphrase_injector import ensure_catchphrases
+from pipeline.prediction_tracker   import (
+    save_predictions_from_script, get_prediction_scoreboard, format_scoreboard_text
+)
+from pipeline.content_calendar     import (
+    suggest_next_format, get_content_health_report, check_format_allowed
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +68,17 @@ AVATAR_CHOICES = [(f"{v['name']} ({LANGUAGES.get(v['language'], v['language'])})
                   for k, v in AVATARS.items()]
 LANGUAGE_CHOICES = [(v, k) for k, v in LANGUAGES.items()]
 FORMAT_CHOICES   = [(v["desc"], k) for k, v in VIDEO_FORMATS.items()]
+CHARACTER_CHOICES = [("Kavya (Telugu F, Hyderabad)", "kavya"),
+                     ("Arjun (Telugu M, Vijayawada)", "arjun")]
+CATEGORY_CHOICES  = [
+    ("Auto Detect", "auto"),
+    ("Bigg Boss", "bigg_boss"),
+    ("Movie Review", "movie_review"),
+    ("Tech Review", "tech_review"),
+    ("General / News", "general"),
+    ("Festival / Special", "festival"),
+    ("Debate", "debate"),
+]
 POSE_CHOICES     = [("Half Body (Default)", "half_body"),
                     ("Standing Full Body", "standing"),
                     ("Sitting at Desk", "sitting_desk")]
@@ -69,23 +90,47 @@ ATTIRE_CHOICES   = [("Professional", "professional"), ("Suit", "suit"),
 # ── Tab 1: Script Preview (after content analysis) ────────────────────────────
 
 def analyse_content(source: str, language: str, format_type: str,
-                    duration: int, topic: str) -> tuple:
+                    duration: int, topic: str,
+                    character_id: str = "kavya",
+                    topic_category: str = "auto",
+                    debate_pos_kavya: str = "in favour",
+                    debate_pos_arjun: str = "against") -> tuple:
     """Step 1: Analyse content and generate script for review."""
     if not source.strip():
-        return gr.update(value="⚠️ Please enter a YouTube URL or paste a script."), "", "", "monologue", []
+        return gr.update(value="⚠️ Please enter a YouTube URL or paste a script."), "", "", "monologue", [], ""
 
-    log.info(f"Analysing content | lang={language} format={format_type}")
+    # Content calendar health check
+    health = get_content_health_report()
+    calendar_note = ""
+    if health["warnings"]:
+        calendar_note = " | ⚠️ " + health["warnings"][0]
+
+    # Format suggestion if not overridden
+    if format_type == "auto":
+        cat = topic_category if topic_category != "auto" else "general"
+        suggested = suggest_next_format(cat)
+        log.info(f"Format auto-detected → {suggested}")
+
+    log.info(f"Analysing content | lang={language} format={format_type} char={character_id}")
+
+    debate_positions = None
+    if format_type == "debate" or (format_type == "auto"):
+        debate_positions = {"kavya": debate_pos_kavya, "arjun": debate_pos_arjun}
 
     result = process_content(
-        source=source.strip(),
-        language=language,
-        format_type=format_type,
-        duration_sec=duration,
-        topic=topic,
+        source         = source.strip(),
+        language       = language,
+        format_type    = format_type,
+        duration_sec   = duration,
+        topic          = topic,
+        character_id   = character_id,
+        topic_category = topic_category if topic_category != "auto" else "general",
+        debate_positions = debate_positions,
+        save_to_memory = True,
     )
 
     if result.get("error"):
-        return gr.update(value=f"❌ Error: {result['error']}"), "", "", "monologue", []
+        return gr.update(value=f"❌ Error: {result['error']}"), "", "", "monologue", [], ""
 
     script   = result["script"]
     fmt      = result["format"]
@@ -93,9 +138,15 @@ def analyse_content(source: str, language: str, format_type: str,
     entities = result["metadata"].get("entities", [])
     scene    = result["metadata"].get("detected_scene", "professional/office")
 
-    info = (f"✅ Script ready | Format: {fmt} | "
-            f"Detected scene: {SCENES.get(scene, {}).get('label', scene)} | "
-            f"Agenda items: {len(agenda)} | Entities: {', '.join(entities) or 'none'}")
+    # Inject catchphrases (guarantee they're in the script)
+    script = ensure_catchphrases(script, character_id, fmt)
+
+    # Prediction scoreboard for display
+    scoreboard = format_scoreboard_text(get_prediction_scoreboard())
+
+    info = (f"✅ Script ready | Character: {character_id.title()} | Format: {fmt} | "
+            f"Scene: {SCENES.get(scene, {}).get('label', scene)} | "
+            f"Entities: {', '.join(entities[:5]) or 'none'}{calendar_note}")
 
     return (
         gr.update(value=info),
@@ -103,6 +154,7 @@ def analyse_content(source: str, language: str, format_type: str,
         scene,
         fmt,
         agenda,
+        scoreboard,
     )
 
 
@@ -112,6 +164,8 @@ def generate_video(
     # Content
     approved_script: str,
     language: str,
+    # Character
+    character_id: str,
     # Avatar
     persona_id: str,
     pose: str,
@@ -158,24 +212,36 @@ def generate_video(
             return (f"❌ Avatar not found: {persona_id}/{pose}/{attire}. "
                     f"Run scripts/generate_avatars.py first."), None, None
 
-        # ── Step 2: TTS ───────────────────────────────────────────────────────
+        # ── Step 2: TTS (using character bible voice config) ─────────────────
         progress(0.10, desc="Generating voice...")
-        profile  = AVATARS[persona_id]["voice_profile"]
-        voice    = VOICE_PROFILES.get(profile, {})
-        ref_wav  = None  # TODO: wire up voice reference WAV
+        # Character bible overrides generic AVATARS config for Kavya/Arjun
+        tts_cfg   = get_tts_config(character_id) if character_id in ("kavya", "arjun") else {}
+        profile   = tts_cfg.get("engine", AVATARS[persona_id]["voice_profile"])
+        ref_wav   = (ROOT / tts_cfg["ref_audio"]) if tts_cfg.get("ref_audio") else None
+        if ref_wav and not ref_wav.exists():
+            ref_wav = None
         audio_raw = job_dir / "voice_raw.wav"
 
-        # For debate: split script
-        if format_type == "debate" and "SPEAKER_A:" in approved_script.upper():
-            from pipeline.script_engine import split_debate_script
-            lines_a, lines_b = split_debate_script(approved_script)
-            script_a = " ".join(lines_a)
-            script_b = " ".join(lines_b)
+        # For debate: split KAVYA:/ARJUN: tagged script
+        if format_type == "debate":
+            kavya_lines, arjun_lines = [], []
+            for line in approved_script.splitlines():
+                stripped = line.strip()
+                if stripped.upper().startswith("KAVYA:"):
+                    kavya_lines.append(stripped[6:].strip())
+                elif stripped.upper().startswith("ARJUN:"):
+                    arjun_lines.append(stripped[6:].strip())
+                elif stripped.upper().startswith("SPEAKER_A:"):
+                    kavya_lines.append(stripped[10:].strip())
+                elif stripped.upper().startswith("SPEAKER_B:"):
+                    arjun_lines.append(stripped[10:].strip())
+            script_a = " ".join(kavya_lines)
+            script_b = " ".join(arjun_lines)
         else:
             script_a = approved_script
             script_b = ""
 
-        ok = synthesize(script_a, profile, audio_raw, ref_wav)
+        ok = synthesize(script_a, profile, audio_raw, str(ref_wav) if ref_wav else None)
         if not ok:
             return "❌ TTS failed. Check logs.", None, None
 
@@ -245,6 +311,16 @@ def generate_video(
         if not ok or not final_video.exists():
             return "❌ Compose step failed. Check logs/app.log.", None, None
 
+        # ── Save predictions to tracker ───────────────────────────────────────
+        try:
+            from pipeline.memory_db import get_recent_episodes
+            recent_eps = get_recent_episodes(1)
+            if recent_eps:
+                ep_id = recent_eps[0]["id"]
+                save_predictions_from_script(approved_script, character_id, ep_id, format_type)
+        except Exception as e:
+            log.warning(f"Prediction tracker save failed (non-blocking): {e}")
+
         # ── Save script ───────────────────────────────────────────────────────
         script_file = job_dir / f"script_{job_id}.txt"
         script_file.write_text(approved_script, encoding="utf-8")
@@ -290,10 +366,11 @@ def build_ui() -> gr.Blocks:
         """)
 
         # ── Shared state ──────────────────────────────────────────────────────
-        state_script = gr.State("")
-        state_scene  = gr.State("professional/office")
-        state_format = gr.State("monologue")
-        state_agenda = gr.State([])
+        state_script    = gr.State("")
+        state_scene     = gr.State("professional/office")
+        state_format    = gr.State("monologue")
+        state_agenda    = gr.State([])
+        state_character = gr.State("kavya")
 
         with gr.Tabs():
 
@@ -312,14 +389,30 @@ def build_ui() -> gr.Blocks:
                             placeholder="e.g. Google I/O 2025 AI announcements",
                         )
                     with gr.Column(scale=1):
-                        lang_input    = gr.Dropdown(LANGUAGE_CHOICES, value="te", label="Language")
-                        format_input  = gr.Dropdown(FORMAT_CHOICES + [("Auto Detect", "auto")],
-                                                    value="auto", label="Video Format")
-                        duration_input = gr.Slider(30, 600, value=180, step=30,
-                                                   label="Target Duration (seconds)")
+                        lang_input      = gr.Dropdown(LANGUAGE_CHOICES, value="te", label="Language")
+                        format_input    = gr.Dropdown(FORMAT_CHOICES + [("Auto Detect", "auto")],
+                                                      value="auto", label="Video Format")
+                        category_input  = gr.Dropdown(CATEGORY_CHOICES, value="auto",
+                                                       label="Topic Category")
+                        character_input = gr.Dropdown(CHARACTER_CHOICES, value="kavya",
+                                                       label="Primary Character (Kavya / Arjun)")
+                        duration_input  = gr.Slider(30, 600, value=180, step=30,
+                                                    label="Target Duration (seconds)")
 
-                analyse_btn = gr.Button("🔍 Analyse & Generate Script", variant="primary")
-                status_1    = gr.Textbox(label="Status", interactive=False, elem_classes="status-box")
+                with gr.Accordion("Debate Settings (if format = Debate)", open=False):
+                    with gr.Row():
+                        debate_kavya_pos = gr.Textbox(
+                            label="Kavya's Position", value="in favour",
+                            placeholder="e.g. in favour, pro, supports"
+                        )
+                        debate_arjun_pos = gr.Textbox(
+                            label="Arjun's Position", value="against",
+                            placeholder="e.g. against, skeptical, neutral"
+                        )
+
+                analyse_btn  = gr.Button("🔍 Analyse & Generate Script", variant="primary")
+                status_1     = gr.Textbox(label="Status", interactive=False, elem_classes="status-box")
+                scoreboard_display = gr.Textbox(label="Prediction Scoreboard", interactive=False)
 
             # ─────────────────────────────────────────────────────────────────
             with gr.TabItem("2 · Review Script"):
@@ -419,16 +512,18 @@ def build_ui() -> gr.Blocks:
 
         analyse_btn.click(
             fn=analyse_content,
-            inputs=[source_input, lang_input, format_input, duration_input, topic_input],
-            outputs=[status_1, script_box, state_scene, state_format, state_agenda],
+            inputs=[source_input, lang_input, format_input, duration_input, topic_input,
+                    character_input, category_input, debate_kavya_pos, debate_arjun_pos],
+            outputs=[status_1, script_box, state_scene, state_format, state_agenda, scoreboard_display],
         ).then(
-            fn=lambda scene, fmt, agenda: (
+            fn=lambda scene, fmt, agenda, char_id: (
                 SCENES.get(scene, {}).get("label", scene) + " | Format: " + fmt,
                 agenda,
                 scene,
+                char_id,
             ),
-            inputs=[state_scene, state_format, state_agenda],
-            outputs=[detected_info, agenda_display, scene_input],
+            inputs=[state_scene, state_format, state_agenda, character_input],
+            outputs=[detected_info, agenda_display, scene_input, state_character],
         )
 
         approve_btn.click(
@@ -441,6 +536,7 @@ def build_ui() -> gr.Blocks:
             fn=generate_video,
             inputs=[
                 state_script, lang_input,
+                state_character,
                 persona_input, pose_input, attire_input,
                 scene_input, state_format,
                 avatar_name_input, avatar_title_input,

@@ -17,6 +17,11 @@ import httpx
 import requests
 
 from config import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, LANGUAGES, BRAND_SCENE_MAP
+from pipeline.character_bible import (
+    build_character_system_prompt, build_debate_system_prompt,
+    who_leads_topic, get_character, CHARACTERS
+)
+from pipeline.memory_db import build_script_context, format_context_for_prompt
 
 log = logging.getLogger("script_engine")
 
@@ -136,17 +141,36 @@ def check_similarity(original: str, rewritten: str) -> float:
 
 def generate_script(facts: list[str], language: str, format_type: str,
                     topic: str = "", tone: str = "professional",
-                    duration_sec: int = 180) -> str:
+                    duration_sec: int = 180,
+                    character_id: str = "kavya",
+                    topic_category: str = "general",
+                    entity_names: list[str] = None,
+                    debate_positions: dict = None) -> str:
     """
     Layer 3: Generate completely fresh script from facts only.
+    Character personality and memory context injected into every call.
     New structure, new angle, new transitions — original source unrecognisable.
     """
     lang_name = LANGUAGES.get(language, "English")
-    word_count = int(duration_sec * 2.5)   # ~2.5 words/sec average speech rate
+    word_count = int(duration_sec * 2.5)
+
+    # ── Memory context — what we've covered before ───────────────────────────
+    mem_ctx = build_script_context(topic, entity_names or [])
+    memory_block = format_context_for_prompt(mem_ctx)
+
+    # ── Character personality injection ──────────────────────────────────────
+    if format_type == "debate":
+        kavya_pos  = (debate_positions or {}).get("kavya", "in favour")
+        arjun_pos  = (debate_positions or {}).get("arjun", "against")
+        char_block = build_debate_system_prompt(topic, kavya_pos, arjun_pos)
+        speaker_rule = "- Mark each speaker as KAVYA: or ARJUN: before every line"
+    else:
+        char_block  = build_character_system_prompt(character_id, topic, format_type)
+        speaker_rule = ""
 
     format_instructions = {
         "monologue":   "Single presenter. Natural conversational flow. Use first person.",
-        "debate":      "TWO speakers: SPEAKER_A (pro/for) and SPEAKER_B (con/against). Label each line. Make it engaging.",
+        "debate":      "TWO speakers: KAVYA (challenger) and ARJUN (anchor). Make it feel like a real disagreement.",
         "news_anchor": "Professional news anchor style. Formal, authoritative. Short punchy sentences.",
         "seminar":     "Academic/professional presentation. Well-structured with transitions. Include agenda.",
         "short":       "Hook in first sentence. Very concise. Max 150 words total. High energy.",
@@ -154,9 +178,15 @@ def generate_script(facts: list[str], language: str, format_type: str,
 
     agenda_instruction = ""
     if format_type in ("monologue", "seminar", "news_anchor") and len(facts) > 3:
-        agenda_instruction = "Start with a compelling hook line, then say 'Today we cover:' and list the top 3-4 topics naturally."
+        agenda_instruction = "Start with a compelling hook line, then mention 3-4 topics you'll cover."
 
-    prompt = f"""Write a complete video script in {lang_name} language.
+    prompt = f"""{char_block}
+
+--- MEMORY / PAST EPISODES ---
+{memory_block if memory_block else "This is the first episode. No prior context."}
+--- END MEMORY ---
+
+Write a complete video script in {lang_name} language.
 
 Format: {format_instructions.get(format_type, format_instructions['monologue'])}
 Tone: {tone}
@@ -164,18 +194,20 @@ Target length: approximately {word_count} words
 Topic: {topic or 'General information'}
 {agenda_instruction}
 
-Facts to cover (use ALL of them, but in your OWN words and structure):
+Facts to cover (use ALL in your OWN words):
 {chr(10).join(f'- {f}' for f in facts[:30])}
 
 Requirements:
-- Write ENTIRELY in {lang_name}
-- Use natural speech rhythm with commas and pauses
-- Include emotional transitions (excitement, gravity, curiosity)
-- Add breathing indicators [breath] before long sentences
+- Write in {lang_name} using the character's language mix as instructed
+- Natural speech rhythm with commas and pauses
+- Emotional transitions (excitement, gravity, curiosity)
+- Add [breath] before sentences longer than 20 words
 - Do NOT copy any original source sentences
-- Start with a strong hook that grabs attention in 5 seconds
-- End with a clear call to action or memorable closing line
-{"- Mark each speaker change as SPEAKER_A: or SPEAKER_B:" if format_type == "debate" else ""}
+- Include at least one catchphrase from the character's list
+- If memory shows past coverage on this topic, reference it naturally
+- If open predictions exist on this topic, acknowledge them
+- Start with a strong hook. End with memorable closing + subscribe call
+{speaker_rule}
 
 Write the complete script now:"""
 
@@ -321,6 +353,10 @@ def process_content(
     duration_sec: int = 180,
     topic: str = "",
     work_dir: Optional[Path] = None,
+    character_id: str = "kavya",
+    topic_category: str = "general",
+    debate_positions: dict = None,
+    save_to_memory: bool = True,
 ) -> dict:
     """
     Full pipeline: source → approved script ready for TTS.
@@ -374,9 +410,17 @@ def process_content(
         log.warning("No facts extracted — using full transcript as base")
         facts = [s.strip() for s in original_transcript.split('. ') if s.strip()][:30]
 
-    # ── Step 4: Generate fresh script ────────────────────────────────────────
-    log.info(f"Generating {format_type} script in {language}...")
-    script = generate_script(facts, language, format_type, topic, detected.get("tone", "professional"), duration_sec)
+    # ── Step 4: Generate fresh script (with character + memory) ─────────────
+    log.info(f"Generating {format_type} script in {language} for {character_id}...")
+    script = generate_script(
+        facts, language, format_type, topic,
+        tone              = detected.get("tone", "professional"),
+        duration_sec      = duration_sec,
+        character_id      = character_id,
+        topic_category    = topic_category,
+        entity_names      = entities,
+        debate_positions  = debate_positions,
+    )
     if not script:
         result["error"] = "Script generation failed. Check Ollama is running."
         return result
@@ -400,6 +444,36 @@ def process_content(
             "speaker_a": " ".join(lines_a),
             "speaker_b": " ".join(lines_b),
         }
+
+    # ── Step 9: Save to content memory ───────────────────────────────────────
+    if save_to_memory and result["script"]:
+        try:
+            from pipeline.memory_db import (
+                save_episode, get_or_create_entity, link_entity_to_episode, log_episode_format
+            )
+            # Generate a 2-sentence summary for memory
+            summary_prompt = f"Summarise this script in 2 sentences max:\n{result['script'][:500]}"
+            summary = _ollama(summary_prompt, temperature=0.3) or topic
+
+            ep_id = save_episode(
+                title          = topic or f"{format_type} episode",
+                topic_category = topic_category,
+                format_type    = format_type,
+                summary        = summary[:300],
+                youtube_url    = source if source.startswith("http") else None,
+                duration_sec   = duration_sec,
+            )
+            # Track entities
+            for ent_name in entities[:10]:
+                ent_id = get_or_create_entity(ent_name, "entity")
+                link_entity_to_episode(ep_id, ent_id)
+
+            log_episode_format(ep_id, format_type, default_scene, character_id,
+                               "arjun" if format_type == "debate" else None)
+            result["episode_id"] = ep_id
+            log.info(f"Saved episode {ep_id} to content memory")
+        except Exception as e:
+            log.warning(f"Memory save failed (non-blocking): {e}")
 
     log.info("Script pipeline complete")
     return result
