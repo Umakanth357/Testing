@@ -16,6 +16,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+# ── Gradio 4.44.0 bug fix (must be before `import gradio`) ───────────────────
+# gradio_client.utils.get_type crashes with TypeError when schema is a bool
+# (e.g. additionalProperties: true/false). Monkey-patch before gradio loads.
+import gradio_client.utils as _gcu_patch
+_gcu_orig_get_type = _gcu_patch.get_type
+def _gcu_safe_get_type(schema):
+    if not isinstance(schema, dict):
+        return "any"
+    return _gcu_orig_get_type(schema)
+_gcu_patch.get_type = _gcu_safe_get_type
+# ─────────────────────────────────────────────────────────────────────────────
+
 import gradio as gr
 from dotenv import load_dotenv
 
