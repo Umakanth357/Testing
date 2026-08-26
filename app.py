@@ -8,6 +8,7 @@ Tabs:
   4. Review     — Script approval gate before generation
   5. Generate   — Run pipeline, download output
 """
+import json
 import logging
 import sys
 import uuid
@@ -15,27 +16,6 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-
-# ── Gradio 4.44.0 bug fix (must be before `import gradio`) ───────────────────
-# gradio_client.utils crashes when a JSON schema field is a plain bool
-# (e.g. additionalProperties: true). Both get_type() and the inner recursive
-# _json_schema_to_python_type() must handle non-dict schemas gracefully.
-import gradio_client.utils as _gcu_patch
-
-_gcu_orig_get_type = _gcu_patch.get_type
-def _gcu_safe_get_type(schema):
-    if not isinstance(schema, dict):
-        return "any"
-    return _gcu_orig_get_type(schema)
-_gcu_patch.get_type = _gcu_safe_get_type
-
-_gcu_orig_inner = _gcu_patch._json_schema_to_python_type
-def _gcu_safe_inner(schema, defs=None):
-    if not isinstance(schema, dict):
-        return "any"
-    return _gcu_orig_inner(schema, defs)
-_gcu_patch._json_schema_to_python_type = _gcu_safe_inner
-# ─────────────────────────────────────────────────────────────────────────────
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -174,7 +154,7 @@ def analyse_content(source: str, language: str, format_type: str,
         script,
         scene,
         fmt,
-        agenda,
+        json.dumps(agenda, ensure_ascii=False),   # str so gr.State("[]") stays happy
         scoreboard,
     )
 
@@ -390,7 +370,7 @@ def build_ui() -> gr.Blocks:
         state_script    = gr.State("")
         state_scene     = gr.State("professional/office")
         state_format    = gr.State("monologue")
-        state_agenda    = gr.State([])
+        state_agenda    = gr.State("[]")   # JSON string — gr.State([]) causes additionalProperties:true schema crash
         state_character = gr.State("navya")
 
         with gr.Tabs():
@@ -442,7 +422,7 @@ def build_ui() -> gr.Blocks:
                 script_box = gr.Textbox(label="Generated Script", lines=20,
                                         placeholder="Script will appear here after Step 1...")
                 with gr.Row():
-                    agenda_display = gr.JSON(label="Detected Agenda Items")
+                    agenda_display = gr.Textbox(label="Detected Agenda Items (JSON)", interactive=False, lines=3)
                     detected_info  = gr.Textbox(label="Detected Scene & Format",
                                                 interactive=False)
                 approve_btn = gr.Button("✅ Approve Script → Proceed to Generate", variant="primary")
@@ -537,9 +517,9 @@ def build_ui() -> gr.Blocks:
                     character_input, category_input, debate_navya_pos, debate_arjun_pos],
             outputs=[status_1, script_box, state_scene, state_format, state_agenda, scoreboard_display],
         ).then(
-            fn=lambda scene, fmt, agenda, char_id: (
+            fn=lambda scene, fmt, agenda_str, char_id: (
                 SCENES.get(scene, {}).get("label", scene) + " | Format: " + fmt,
-                agenda,
+                agenda_str,   # already a JSON string
                 scene,
                 char_id,
             ),
