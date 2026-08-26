@@ -1,177 +1,151 @@
+#!/usr/bin/env python3
 """
-Download CC0 background video loops from Pexels/Pixabay.
-All videos are Creative Commons Zero (public domain) — safe for commercial use.
+Avatar Studio — Background Generator
+Creates solid-color and gradient placeholder backgrounds for all scene types.
+No internet needed — pure PIL generation. Run once after setup.
 
-For brand stages (Google, Apple, Samsung): uses publicly available footage
-cropped as backgrounds. Internal use only — verify before public deployment.
+Usage: python scripts/download_backgrounds.py
 """
 import sys
-import logging
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
-log = logging.getLogger("download_backgrounds")
+from PIL import Image, ImageDraw, ImageFilter
+import colorsys
 
-from config import BACKGROUNDS_DIR, SFX_DIR
+BG_DIR = ROOT / "models" / "backgrounds"
+BG_DIR.mkdir(parents=True, exist_ok=True)
 
-# CC0 video backgrounds from Pexels (public domain)
-# Format: filename → Pexels video URL
-# NOTE: Pexels requires a free API key for programmatic download.
-# If URL fails, download manually from pexels.com and place in models/backgrounds/
-BACKGROUND_VIDEOS = {
-    "office_loop.mp4":        "https://www.pexels.com/video/852390/",
-    "news_desk_loop.mp4":     "https://www.pexels.com/video/3753705/",
-    "seminar_hall_loop.mp4":  "https://www.pexels.com/video/2278095/",
-    "stage_dias_loop.mp4":    "https://www.pexels.com/video/2795405/",
-    "conference_loop.mp4":    "https://www.pexels.com/video/3130284/",
-    "glacier_loop.mp4":       "https://www.pexels.com/video/857136/",
-    "beach_loop.mp4":         "https://www.pexels.com/video/854643/",
-    "forest_loop.mp4":        "https://www.pexels.com/video/1448735/",
-    "mountain_loop.mp4":      "https://www.pexels.com/video/855117/",
-    "kitchen_loop.mp4":       "https://www.pexels.com/video/3256542/",
-    "living_room_loop.mp4":   "https://www.pexels.com/video/3769128/",
-    "bedroom_loop.mp4":       "https://www.pexels.com/video/5543505/",
-    "cafe_loop.mp4":          "https://www.pexels.com/video/3178591/",
-    "rooftop_loop.mp4":       "https://www.pexels.com/video/3752930/",
-    "red_fort_loop.mp4":      "https://www.pexels.com/video/3763876/",
-    "parliament_loop.mp4":    "https://www.pexels.com/video/3763876/",
-    "tech_park_loop.mp4":     "https://www.pexels.com/video/3130290/",
-    "market_loop.mp4":        "https://www.pexels.com/video/2278095/",
-    "dark_studio_loop.mp4":   "https://www.pexels.com/video/2795405/",
-    "gradient_blue_loop.mp4": None,  # Generated procedurally below
-    # Brand stages — use placeholder, replace with actual footage
-    "google_stage_loop.mp4":  None,
-    "apple_stage_loop.mp4":   None,
-    "samsung_stage_loop.mp4": None,
-    "ted_stage_loop.mp4":     None,
-}
+W, H = 1920, 1080   # 16:9 Full HD
 
-# CC0 ambient sound files
-AMBIENT_SOUNDS = {
-    "silence.wav":         None,  # Generated as silence
-    "office_hum.wav":      "https://freesound.org/data/previews/263/263178_4486188-lq.mp3",
-    "crowd_murmur.wav":    "https://freesound.org/data/previews/212/212371_2398403-lq.mp3",
-    "waves_birds.wav":     "https://freesound.org/data/previews/212/212371_2398403-lq.mp3",
-    "wind_cold.wav":       "https://freesound.org/data/previews/91/91763_1315829-lq.mp3",
-    "wind_soft.wav":       "https://freesound.org/data/previews/91/91763_1315829-lq.mp3",
-    "forest_birds.wav":    "https://freesound.org/data/previews/416/416013_2437358-lq.mp3",
-    "cafe_ambient.wav":    "https://freesound.org/data/previews/263/263178_4486188-lq.mp3",
-    "city_ambient.wav":    "https://freesound.org/data/previews/212/212371_2398403-lq.mp3",
-    "market_crowd.wav":    "https://freesound.org/data/previews/212/212371_2398403-lq.mp3",
-    "kitchen_ambient.wav": "https://freesound.org/data/previews/263/263178_4486188-lq.mp3",
-    "studio_silence.wav":  None,
-}
+# ── Scene background definitions ──────────────────────────────────────────────
+# Each entry: (filename, type, colors, description)
+# type: "solid", "gradient", "vignette"
+
+BACKGROUNDS = [
+    # Professional
+    ("office_loop.mp4",        "gradient",  ["#1a1a2e", "#16213e", "#0f3460"],  "Deep blue office night"),
+    ("news_desk_loop.mp4",     "vignette",  ["#0d0d0d", "#1a1a1a", "#141414"],  "Dark studio news"),
+    ("seminar_hall_loop.mp4",  "gradient",  ["#1e3a5f", "#0d2137", "#142840"],  "Conference blue"),
+    ("stage_dias_loop.mp4",    "gradient",  ["#2c0a37", "#1a0525", "#3d1254"],  "Stage purple"),
+    ("conference_loop.mp4",    "gradient",  ["#1a2f1a", "#0d200d", "#213321"],  "Corporate green"),
+    # Nature
+    ("glacier_loop.mp4",       "gradient",  ["#a8d8f0", "#c5e8ff", "#7fc0e0"],  "Glacier blue sky"),
+    ("beach_loop.mp4",         "gradient",  ["#4a90d9", "#6bb8f0", "#87ceeb"],  "Beach blue sky"),
+    ("forest_loop.mp4",        "gradient",  ["#1a3d1a", "#0d2d0d", "#2a5a2a"],  "Forest green"),
+    ("mountain_loop.mp4",      "gradient",  ["#8fb4cc", "#b0cde0", "#6a9ab5"],  "Mountain sky"),
+    # Casual
+    ("kitchen_loop.mp4",       "gradient",  ["#f5e6d3", "#eedfc5", "#e8d4b5"],  "Warm kitchen"),
+    ("living_room_loop.mp4",   "gradient",  ["#d4c4a8", "#c8b896", "#bfaa84"],  "Living room warm"),
+    ("bedroom_loop.mp4",       "gradient",  ["#e8d4e8", "#dcc8dc", "#d0bcd0"],  "Bedroom soft"),
+    ("cafe_loop.mp4",          "gradient",  ["#6b4226", "#4a2d18", "#7d4f2e"],  "Cafe brown"),
+    ("rooftop_loop.mp4",       "gradient",  ["#ff7e5f", "#feb47b", "#e8734a"],  "Sunset orange"),
+    # Landmark
+    ("red_fort_loop.mp4",      "gradient",  ["#c45c1a", "#8b3a0d", "#d4703a"],  "Red fort warm"),
+    ("parliament_loop.mp4",    "gradient",  ["#1c3a5e", "#0f2540", "#2a4f7a"],  "Parliament blue"),
+    ("tech_park_loop.mp4",     "gradient",  ["#1a2633", "#0d1a26", "#223344"],  "Tech dark"),
+    ("market_loop.mp4",        "gradient",  ["#c4922a", "#9b6e1a", "#d4a840"],  "Market gold"),
+    # Brand
+    ("google_stage_loop.mp4",  "gradient",  ["#0d0d0d", "#1a1a1a", "#0a0a0a"],  "Google dark stage"),
+    ("apple_stage_loop.mp4",   "solid",     ["#000000"],                          "Apple black"),
+    ("samsung_stage_loop.mp4", "gradient",  ["#001e3c", "#00345a", "#001428"],    "Samsung navy"),
+    ("ted_stage_loop.mp4",     "gradient",  ["#cc0000", "#990000", "#dd1111"],    "TED red"),
+    # Abstract
+    ("dark_studio_loop.mp4",   "vignette",  ["#0a0a0a", "#1a1a1a", "#050505"],   "Dark studio"),
+    ("gradient_blue_loop.mp4", "gradient",  ["#0033aa", "#0055cc", "#0044bb"],    "Gradient blue"),
+]
 
 
-def generate_procedural_background(filename: str, dest: Path) -> bool:
-    """Generate a simple gradient or solid color background video using FFmpeg."""
-    import subprocess
-
-    color_map = {
-        "gradient_blue_loop.mp4": "0x0d1b2a",
-        "google_stage_loop.mp4":  "0x1a73e8",
-        "apple_stage_loop.mp4":   "0x1d1d1f",
-        "samsung_stage_loop.mp4": "0x1428a0",
-        "ted_stage_loop.mp4":     "0xeb0028",
-    }
-    color = color_map.get(filename, "0x1a1a2e")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"color=c={color}:size=1920x1080:rate=25",
-        "-t", "10",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        str(dest),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
-        return result.returncode == 0 and dest.exists()
-    except Exception as e:
-        log.error(f"Procedural background failed: {e}")
-        return False
+def hex_to_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
-def generate_silence(dest: Path, duration_sec: float = 10.0) -> bool:
-    import subprocess
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-        "-t", str(duration_sec),
-        "-c:a", "pcm_s16le",
-        str(dest),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
-        return result.returncode == 0
-    except Exception:
-        return False
+def make_gradient(colors: list[str], w: int = W, h: int = H) -> Image.Image:
+    """Create a smooth top-to-bottom gradient between 2-3 colors."""
+    img = Image.new("RGB", (w, h))
+    draw = ImageDraw.Draw(img)
+    c1 = hex_to_rgb(colors[0])
+    c2 = hex_to_rgb(colors[-1])
+    for y in range(h):
+        t = y / h
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        draw.line([(0, y), (w, y)], fill=(r, g, b))
+    return img
+
+
+def make_solid(colors: list[str], w: int = W, h: int = H) -> Image.Image:
+    return Image.new("RGB", (w, h), hex_to_rgb(colors[0]))
+
+
+def make_vignette(colors: list[str], w: int = W, h: int = H) -> Image.Image:
+    """Dark center-fade vignette."""
+    base = make_gradient(colors, w, h)
+    vignette = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(vignette)
+    cx, cy = w // 2, h // 2
+    for r in range(max(w, h), 0, -1):
+        alpha = int(255 * (1 - r / max(w, h)) * 0.6)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=alpha)
+    vignette = vignette.filter(ImageFilter.GaussianBlur(80))
+    overlay = Image.new("RGB", (w, h), (0, 0, 0))
+    base = Image.composite(base, overlay, vignette)
+    return base
+
+
+def save_as_video_placeholder(img: Image.Image, path: Path):
+    """
+    Save as PNG (app falls back to static image if .mp4 not found).
+    Also save as .mp4 placeholder name so config lookups don't fail.
+    """
+    png_path = path.with_suffix(".png")
+    img.save(str(png_path), "PNG")
+    # Create a symlink from .mp4 → .png for code that does Path(...).exists()
+    if not path.exists():
+        try:
+            path.symlink_to(png_path.name)
+        except Exception:
+            # Windows doesn't support symlinks easily — just copy
+            img.save(str(path.with_suffix(".png")), "PNG")
 
 
 def main():
-    BACKGROUNDS_DIR.mkdir(parents=True, exist_ok=True)
-    SFX_DIR.mkdir(parents=True, exist_ok=True)
+    print("\n╔══════════════════════════════════════╗")
+    print("║  Avatar Studio — Background Generator ║")
+    print("╚══════════════════════════════════════╝")
+    print(f"Output: {BG_DIR}")
+    print(f"Resolution: {W}x{H}")
+    print()
 
-    log.info("Setting up background library...")
-    log.info("NOTE: Pexels requires manual download. Generating placeholders for missing files.")
-    log.info("      Replace placeholder files with real CC0 footage from pexels.com")
+    skip = done = 0
+    for filename, bg_type, colors, label in BACKGROUNDS:
+        out_path = BG_DIR / filename
+        png_path = out_path.with_suffix(".png")
 
-    # Generate all backgrounds (as placeholders if URL not directly downloadable)
-    for filename, url in BACKGROUND_VIDEOS.items():
-        dest = BACKGROUNDS_DIR / filename
-        if dest.exists():
-            log.info(f"  ✓ {filename} (exists)")
+        if png_path.exists():
+            print(f"  SKIP {label}")
+            skip += 1
             continue
 
-        if url is None:
-            # Generate procedurally
-            if generate_procedural_background(filename, dest):
-                log.info(f"  ✓ {filename} (generated)")
-            else:
-                log.warning(f"  ✗ {filename} (generation failed)")
+        if bg_type == "solid":
+            img = make_solid(colors)
+        elif bg_type == "vignette":
+            img = make_vignette(colors)
         else:
-            # Try direct download (may fail if Pexels requires auth)
-            try:
-                urllib.request.urlretrieve(url, str(dest))
-                log.info(f"  ✓ {filename} (downloaded)")
-            except Exception:
-                # Generate procedural placeholder
-                log.warning(f"  ⚠ {filename} — download failed, generating placeholder")
-                generate_procedural_background(filename, dest)
+            img = make_gradient(colors)
 
-    # Generate ambient sounds
-    log.info("\nSetting up ambient sound library...")
-    for filename, url in AMBIENT_SOUNDS.items():
-        dest = SFX_DIR / filename
-        if dest.exists():
-            log.info(f"  ✓ {filename} (exists)")
-            continue
+        img.save(str(png_path), "PNG")
+        print(f"  GEN  {label:<35} → {png_path.name}")
+        done += 1
 
-        if url is None:
-            if generate_silence(dest):
-                log.info(f"  ✓ {filename} (silence generated)")
-        else:
-            try:
-                urllib.request.urlretrieve(url, str(dest.with_suffix(".mp3")))
-                # Convert MP3 → WAV
-                import subprocess
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", str(dest.with_suffix(".mp3")),
-                    "-ar", "44100", "-ac", "1", str(dest),
-                ], capture_output=True, timeout=30)
-                dest.with_suffix(".mp3").unlink(missing_ok=True)
-                log.info(f"  ✓ {filename} (downloaded)")
-            except Exception:
-                generate_silence(dest)
-                log.warning(f"  ⚠ {filename} — using silence placeholder")
-
-    log.info("\nBackground library setup complete.")
-    log.info(f"Location: {BACKGROUNDS_DIR}")
-    log.info("Replace placeholder files with real CC0 footage from pexels.com for best quality.")
+    print(f"\nDone: {done} generated, {skip} skipped.")
+    print("Backgrounds saved as PNG files in models/backgrounds/")
+    print("\nNote: These are static placeholders. For animated backgrounds,")
+    print("replace .png files with actual .mp4 video loops (same filenames).")
 
 
 if __name__ == "__main__":
