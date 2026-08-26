@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 Avatar Studio — Avatar Image Generator
-Generates Navya Reddy + Arjun Varma avatar images using FLUX.1-schnell + Desi Espresso LoRA.
-Run once after setup. Images are saved to models/avatars/ and never regenerated unless deleted.
+Generates Navya Reddy + Arjun Varma avatar images using Stable Diffusion XL.
 
+Why SDXL instead of FLUX.1-schnell:
+  - FLUX full pipeline = ~33GB download, T5-XXL alone = 9.5GB RAM → OOM on g4dn.2xlarge (32GB RAM)
+  - SDXL = ~6.5GB VRAM, 7GB download, runs cleanly on T4 16GB
+  - SDXL is not gated (no HF terms required)
+  - Portrait quality is equivalent for this use case with good prompts
+
+Run once after setup. Images saved to models/avatars/ and never regenerated unless deleted.
 Usage: python scripts/generate_avatars.py
 """
 import sys
@@ -18,44 +24,49 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 import torch
-from diffusers import FluxPipeline
+from diffusers import StableDiffusionXLPipeline
 from PIL import Image
 
 # ── Config ────────────────────────────────────────────────────────────────────
 AVATARS_DIR = ROOT / "models" / "avatars"
 AVATARS_DIR.mkdir(parents=True, exist_ok=True)
 
-FLUX_MODEL = "black-forest-labs/FLUX.1-schnell"   # Apache 2.0 — commercial safe
-FLUX_LORA  = "prithivMLmods/Desi-Espresso-Flux"   # South Indian faces LoRA
+# SDXL base — Apache 2.0, not gated, 6.5GB VRAM, runs on T4
+SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-HF_TOKEN   = os.environ.get("HF_TOKEN")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 print(f"Device: {DEVICE} | GPU: {torch.cuda.get_device_name(0) if DEVICE == 'cuda' else 'none'}")
+if DEVICE == "cuda":
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"VRAM: {vram:.1f} GB")
 
 # ── Avatar definitions ────────────────────────────────────────────────────────
-# Navya Reddy — young (22), attractive, South Indian Hyderabad Telugu girl
-# Sweet + strong + confident. Must look unique and non-existent (no real person).
+# Navya Reddy — 22yo, attractive Hyderabad Telugu girl, sweet+confident+strong
+# Arjun Varma — 32yo, Vijayawada Telugu professional anchor
+
 NAVYA_BASE = (
-    "photorealistic south indian telugu woman, 22 years old, attractive hyderabad girl, "
-    "warm brown skin, long dark hair, sharp expressive eyes, confident warm smile, "
-    "high cheekbones, elegant facial structure, not a real person, unique face, "
-    "8k resolution, studio lighting, sharp focus, professional portrait, "
-    "Desi Espresso style"
+    "portrait photo of a beautiful south indian telugu woman, 22 years old, "
+    "from hyderabad, warm brown skin, long dark black hair, sharp expressive eyes, "
+    "high cheekbones, elegant facial structure, confident warm smile, "
+    "photorealistic, professional studio portrait, 85mm lens, "
+    "sharp focus, soft studio lighting, 8k uhd, not a real person, unique face"
 )
 
 ARJUN_BASE = (
-    "photorealistic south indian telugu man, 32 years old, vijayawada professional, "
-    "warm brown skin, short dark hair, strong jawline, intelligent eyes, "
-    "confident composed expression, not a real person, unique face, "
-    "8k resolution, studio lighting, sharp focus, professional portrait, "
-    "Desi Espresso style"
+    "portrait photo of a south indian telugu man, 32 years old, "
+    "from vijayawada, warm brown skin, short dark hair, strong jawline, "
+    "intelligent eyes, composed confident expression, "
+    "photorealistic, professional studio portrait, 85mm lens, "
+    "sharp focus, soft studio lighting, 8k uhd, not a real person, unique face"
 )
 
 NEGATIVE = (
-    "blurry, low quality, watermark, text, logo, cartoon, anime, painting, "
-    "drawing, ugly, deformed, bad anatomy, extra fingers, mutation, "
-    "poorly drawn face, nsfw, celebrity, real person, famous person"
+    "blurry, low quality, watermark, text, logo, cartoon, anime, illustration, "
+    "painting, sketch, ugly, deformed, bad anatomy, extra fingers, mutation, "
+    "poorly drawn face, nsfw, celebrity, famous person, plastic, wax, mannequin, "
+    "overexposed, underexposed, grainy, noise"
 )
 
 AVATARS = {
@@ -65,20 +76,20 @@ AVATARS = {
             {
                 "key": "navya_professional",
                 "label": "Navya — Professional Blazer",
-                "suffix": "wearing a sharp navy blue blazer, formal professional attire, half body shot, waist up",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing a sharp navy blue formal blazer over white shirt, waist up half body shot, professional attire",
+                "steps": 40, "guidance": 7.5,
             },
             {
                 "key": "navya_traditional",
                 "label": "Navya — Traditional Saree",
-                "suffix": "wearing an elegant silk saree in deep red and gold, traditional south indian style, half body shot",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing an elegant deep red and gold silk saree, traditional south indian jewelry, half body shot",
+                "steps": 40, "guidance": 7.5,
             },
             {
                 "key": "navya_casual",
                 "label": "Navya — Smart Casual",
-                "suffix": "wearing smart casual clothes, warm approachable look, half body shot",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing smart casual clothes in pastel tones, friendly approachable expression, half body shot",
+                "steps": 40, "guidance": 7.5,
             },
         ],
     },
@@ -88,93 +99,91 @@ AVATARS = {
             {
                 "key": "arjun_suit",
                 "label": "Arjun — Dark Suit",
-                "suffix": "wearing a dark charcoal suit, white shirt, professional business attire, half body shot, waist up",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing a dark charcoal business suit with white shirt, professional anchor look, waist up half body shot",
+                "steps": 40, "guidance": 7.5,
             },
             {
                 "key": "arjun_kurta",
                 "label": "Arjun — Formal Kurta",
-                "suffix": "wearing a formal white kurta, traditional indian male attire, half body shot",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing a crisp white formal kurta, traditional indian male attire, half body shot",
+                "steps": 40, "guidance": 7.5,
             },
             {
                 "key": "arjun_casual",
                 "label": "Arjun — Smart Casual",
-                "suffix": "wearing smart casual polo shirt, relaxed professional look, half body shot",
-                "steps": 4, "guidance": 0.0,
+                "suffix": "wearing smart casual polo shirt in navy, relaxed professional look, half body shot",
+                "steps": 40, "guidance": 7.5,
             },
         ],
     },
 }
 
+
 # ── Load pipeline ─────────────────────────────────────────────────────────────
 
 def load_pipeline():
-    print("\nLoading FLUX.1-schnell pipeline...")
-    print("  (First run downloads ~7GB of model weights — this takes ~5-10 min)")
+    print(f"\nLoading SDXL pipeline from {SDXL_MODEL}...")
+    print("  (First run downloads ~7GB — ~2-3 min on EC2)")
 
-    pipe = FluxPipeline.from_pretrained(
-        FLUX_MODEL,
-        dtype=torch.float16,
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        SDXL_MODEL,
+        torch_dtype=torch.float16,
+        use_safetensors=True,
+        variant="fp16",
         token=HF_TOKEN,
     )
 
-    print("Loading Desi Espresso LoRA (South Indian faces)...")
+    # SDXL fits in T4 16GB VRAM without CPU offload, but enable for safety
+    pipe = pipe.to(DEVICE)
+    pipe.enable_attention_slicing()
+
     try:
-        pipe.load_lora_weights(FLUX_LORA, token=HF_TOKEN)
-        pipe.fuse_lora(lora_scale=0.8)
-        print("  LoRA loaded OK")
-    except Exception as e:
-        print(f"  LoRA load failed ({e}) — continuing without LoRA (quality may be lower)")
+        pipe.enable_xformers_memory_efficient_attention()
+        print("  xformers memory efficient attention: ON")
+    except Exception:
+        print("  xformers not available — using standard attention")
 
-    # T4 has 15.6GB VRAM; FLUX full pipeline ~13-14GB in float16.
-    # Use sequential CPU offload so transformer stays on GPU, encoders move to RAM.
-    pipe.enable_model_cpu_offload()   # moves unused sub-models to CPU between steps
-
-    if DEVICE == "cuda":
-        pipe.enable_attention_slicing()
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
-
+    print("  SDXL pipeline loaded OK")
     return pipe
 
 
 # ── Generate one image ────────────────────────────────────────────────────────
 
-def generate_image(pipe, character: str, variant: dict, base_prompt: str) -> Path:
+def generate_image(pipe, variant: dict, base_prompt: str) -> Path:
     out_path = AVATARS_DIR / f"{variant['key']}.png"
 
     if out_path.exists():
-        print(f"  SKIP {variant['label']} — already exists: {out_path.name}")
+        print(f"  SKIP {variant['label']} — already exists")
         return out_path
 
     full_prompt = f"{base_prompt}, {variant['suffix']}"
     print(f"  GEN  {variant['label']}...")
-    print(f"       Prompt: {full_prompt[:120]}...")
+
+    # Deterministic seed per variant (reproducible across runs)
+    seed = hash(variant["key"]) % (2 ** 32)
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
 
     with torch.inference_mode():
         result = pipe(
             prompt=full_prompt,
-            num_inference_steps=variant.get("steps", 4),
-            guidance_scale=variant.get("guidance", 0.0),
+            negative_prompt=NEGATIVE,
+            num_inference_steps=variant.get("steps", 40),
+            guidance_scale=variant.get("guidance", 7.5),
             height=1024,
-            width=768,   # portrait aspect for half-body
-            generator=torch.Generator(device=DEVICE).manual_seed(
-                hash(variant["key"]) % (2**32)   # deterministic seed per variant
-            ),
+            width=768,        # portrait 3:4 aspect
+            generator=generator,
         )
 
     img = result.images[0]
 
-    # Crop to half-body if image is full body (heuristic: keep top 75%)
+    # Crop to top 85% for half-body framing
     w, h = img.size
     img_crop = img.crop((0, 0, w, int(h * 0.85)))
     img_crop = img_crop.resize((768, 1024), Image.LANCZOS)
-    img_crop.save(str(out_path), "PNG", quality=95)
+    img_crop.save(str(out_path), "PNG")
 
-    print(f"       Saved: {out_path}")
+    size_kb = out_path.stat().st_size // 1024
+    print(f"       Saved → {out_path.name} ({size_kb} KB)")
     return out_path
 
 
@@ -184,7 +193,7 @@ def save_manifest(generated: list[dict]):
     manifest_path = AVATARS_DIR / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(generated, f, indent=2)
-    print(f"\nManifest saved: {manifest_path}")
+    print(f"\nManifest → {manifest_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -193,14 +202,14 @@ def main():
     print("\n╔══════════════════════════════════════╗")
     print("║   Avatar Studio — Image Generator   ║")
     print("╚══════════════════════════════════════╝")
+    print(f"Model : SDXL (stabilityai/stable-diffusion-xl-base-1.0)")
     print(f"Output: {AVATARS_DIR}")
 
-    # Check if all already exist
     all_keys = [v["key"] for char in AVATARS.values() for v in char["variants"]]
     existing = [k for k in all_keys if (AVATARS_DIR / f"{k}.png").exists()]
     if len(existing) == len(all_keys):
-        print("\nAll avatar images already exist — nothing to generate.")
-        print("Delete images from models/avatars/ to regenerate.")
+        print("\nAll 6 avatar images already exist — nothing to generate.")
+        print("Delete images in models/avatars/ to regenerate.")
         return
 
     pipe = load_pipeline()
@@ -209,11 +218,11 @@ def main():
     done = 0
 
     for char_id, char_data in AVATARS.items():
-        print(f"\n--- Generating {char_id.upper()} avatars ---")
+        print(f"\n─── {char_id.upper()} avatars ───")
         for variant in char_data["variants"]:
             done += 1
             print(f"\n[{done}/{total}]", end=" ")
-            out_path = generate_image(pipe, char_id, variant, char_data["base"])
+            out_path = generate_image(pipe, variant, char_data["base"])
             generated.append({
                 "character": char_id,
                 "key": variant["key"],
@@ -222,7 +231,6 @@ def main():
                 "size_kb": round(out_path.stat().st_size / 1024),
             })
 
-    # Clean up GPU memory
     del pipe
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -230,13 +238,11 @@ def main():
     save_manifest(generated)
 
     print("\n╔══════════════════════════════════════╗")
-    print("║         Generation Complete ✓        ║")
+    print("║       Generation Complete ✓          ║")
     print("╚══════════════════════════════════════╝")
     for item in generated:
         print(f"  {item['character']:6} | {item['label']:35} | {item['size_kb']} KB")
-
-    print(f"\nTotal: {len(generated)} images in {AVATARS_DIR}")
-    print("Avatars are locked. App will use these faces consistently.")
+    print(f"\nTotal: {len(generated)} avatars in {AVATARS_DIR}")
 
 
 if __name__ == "__main__":
