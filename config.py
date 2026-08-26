@@ -169,9 +169,9 @@ VOICE_PROFILES = {
                                "speed": 0.95, "pitch": 0.9, "expressivity": "medium"},
     "hi_female_professional": {"engine": "indic", "lang": "hi", "gender": "female", "character_id": "default",
                                "speed": 1.0, "pitch": 1.0, "expressivity": "medium"},
-    "en_male_professional":   {"engine": "chatterbox", "lang": "en", "gender": "male",   "character_id": "default",
+    "en_male_professional":   {"engine": "coqui", "lang": "en", "gender": "male",   "character_id": "default",
                                "speed": 1.0, "pitch": 0.9},
-    "en_female_professional": {"engine": "chatterbox", "lang": "en", "gender": "female", "character_id": "default",
+    "en_female_professional": {"engine": "coqui", "lang": "en", "gender": "female", "character_id": "default",
                                "speed": 1.0, "pitch": 1.0},
 }
 

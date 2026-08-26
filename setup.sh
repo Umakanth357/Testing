@@ -1,111 +1,141 @@
 #!/usr/bin/env bash
 # Avatar Studio — EC2 Setup Script
-# Target: Deep Learning OSS Nvidia Driver AMI (Ubuntu 22.04), Tesla T4, CUDA 13.x
-# Run as: ./setup.sh 2>&1 | tee setup.log
-set -e
+# Target: Deep Learning OSS Nvidia Driver AMI (Ubuntu 22.04), Tesla T4, CUDA 12.x/13.x
+#
+# WHY THIS ORDER MATTERS:
+#   - numpy must be pinned at 1.26.4 BEFORE any other ML package installs
+#   - gfpgan must be >=1.3.8 (older versions require numpy<1.23 — kills everything)
+#   - chatterbox-tts dropped: English-only, no Telugu, causes numpy==1.26.0 hard conflict
+#   - torch/torchvision/torchaudio skipped: AMI already has them with CUDA
+#   - Each group is installed separately so conflicts surface early and clearly
+#
+# Run: chmod +x setup.sh && ./setup.sh 2>&1 | tee setup.log
+set -euo pipefail
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+check_numpy() {
+    local ver
+    ver=$(python -c "import numpy; print(numpy.__version__)" 2>/dev/null || echo "missing")
+    if [[ "$ver" != "1.26"* ]]; then
+        warn "numpy drifted to $ver — re-pinning to 1.26.4..."
+        pip install "numpy==1.26.4" --force-reinstall --quiet
+    else
+        info "numpy $ver OK"
+    fi
+}
+
+# ── 0. Pre-flight checks ──────────────────────────────────────────────────────
+echo ""
 echo "=== Avatar Studio Setup ==="
-echo "Platform: $(uname -m)  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'unknown')"
 
-# ── 0. Load .env ──────────────────────────────────────────────────────────────
 if [ ! -f .env ]; then
-    echo "ERROR: .env file not found. Copy .env.example → .env and set HF_TOKEN."
-    exit 1
+    error ".env file not found. Run: cp /dev/null .env && nano .env  then add HF_TOKEN=hf_..."
 fi
 source .env
-if [ -z "$HF_TOKEN" ]; then
-    echo "ERROR: HF_TOKEN not set in .env"
-    exit 1
-fi
+[ -z "${HF_TOKEN:-}" ] && error "HF_TOKEN not set in .env"
+
+info "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'not detected')"
+info "Python: $(python3 --version)"
 
 # ── 1. System packages ────────────────────────────────────────────────────────
-echo "[1/9] Installing system packages..."
+info "[1/10] System packages..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     ffmpeg git git-lfs curl wget unzip \
-    python3-pip python3-venv \
     libsndfile1 libsndfile1-dev \
-    libgl1-mesa-glx libglib2.0-0
+    libgl1-mesa-glx libglib2.0-0 \
+    python3-pip python3-venv 2>/dev/null
+git lfs install --skip-repo 2>/dev/null || true
 
-git lfs install
-
-# ── 2. Python virtual environment ─────────────────────────────────────────────
-echo "[2/9] Setting up Python venv..."
-python3 -m venv venv
-source venv/bin/activate
-
-# Upgrade pip and wheel
-pip install --upgrade pip wheel setuptools
-
-# ── 3. Pin numpy FIRST — critical to avoid conflicts ─────────────────────────
-# chatterbox-tts, basicsr, realesrgan all require numpy<2.
-# Must install before anything else pulls in a newer numpy.
-echo "[3/9] Pinning numpy==1.26.4 (required by basicsr/realesrgan/chatterbox-tts)..."
-pip install "numpy==1.26.4"
-
-# ── 4. PyTorch — skip if AMI already has it ──────────────────────────────────
-echo "[4/9] Checking PyTorch..."
-if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    echo "    PyTorch with CUDA already available — skipping reinstall."
-    echo "    Version: $(python -c 'import torch; print(torch.__version__)')"
-else
-    echo "    Installing PyTorch 2.1 + CUDA 12.1..."
-    pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
-        --index-url https://download.pytorch.org/whl/cu121
+# ── 2. Virtual environment ────────────────────────────────────────────────────
+info "[2/10] Python virtual environment..."
+if [ ! -d venv ]; then
+    python3 -m venv venv
 fi
+source venv/bin/activate
+pip install --upgrade pip wheel setuptools --quiet
+
+# ── 3. Pin numpy FIRST — CRITICAL ────────────────────────────────────────────
+info "[3/10] Pinning numpy==1.26.4 (must come before everything else)..."
+# This MUST be the first pip install. Any package that runs before this
+# and pulls numpy will get the wrong version and break the entire stack.
+pip install "numpy==1.26.4" --quiet
+check_numpy
+
+# ── 4. PyTorch — skip if AMI already has working CUDA version ────────────────
+info "[4/10] Checking PyTorch + CUDA..."
+if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    TORCH_VER=$(python -c 'import torch; print(torch.__version__)')
+    info "PyTorch $TORCH_VER with CUDA already available — skipping reinstall."
+else
+    warn "PyTorch CUDA not found — installing PyTorch 2.1 + CUDA 12.1..."
+    pip install \
+        "torch==2.1.2" "torchvision==0.16.2" "torchaudio==2.1.2" \
+        --index-url https://download.pytorch.org/whl/cu121 --quiet
+fi
+check_numpy
 
 # ── 5. Core ML packages ───────────────────────────────────────────────────────
-echo "[5/9] Installing core ML packages..."
+info "[5/10] Core ML packages..."
 pip install \
     "transformers>=4.40.0" \
-    "diffusers>=0.27.0" \
+    "diffusers>=0.31.0" \
     "accelerate>=0.28.0" \
     "safetensors>=0.4.0" \
     "peft>=0.10.0" \
     "huggingface-hub>=0.22.0" \
-    "sentence-transformers>=2.7.0"
+    "omegaconf>=2.3.0" \
+    --quiet
+check_numpy
 
-# ── 6. Image/video packages ───────────────────────────────────────────────────
-echo "[6/9] Installing image/video packages..."
-pip install \
-    "Pillow>=10.0.0" \
-    "opencv-python>=4.9.0" \
-    "facexlib>=0.3.0" \
-    "ffmpeg-python>=0.2.0" \
-    "imageio>=2.33.0" \
-    "imageio-ffmpeg>=0.4.9"
+# ── 6. Image restoration stack ───────────────────────────────────────────────
+info "[6/10] Image restoration (basicsr -> facexlib -> gfpgan >= 1.3.8 -> realesrgan)..."
+# gfpgan MUST be >=1.3.8
+# gfpgan <1.3.7 requires numpy<1.23 which breaks the entire stack.
+# This is the most common hidden cause of the numpy ResolutionImpossible error.
+pip install "Pillow>=10.0.0" "opencv-python>=4.9.0" --quiet
+pip install "basicsr>=1.4.2" --quiet
+pip install "facexlib>=0.3.0" --quiet
+pip install "gfpgan>=1.3.8" --quiet
+pip install "realesrgan>=0.3.0" --quiet
+check_numpy
 
-# Install gfpgan/basicsr/realesrgan with --no-deps to prevent numpy upgrade
-echo "    Installing gfpgan (--no-deps to protect numpy pin)..."
-pip install gfpgan --no-deps
-pip install basicsr --no-deps
-pip install realesrgan --no-deps
-# Install their missing deps manually (excluding numpy)
-pip install "scipy>=1.11.0" "tb-nightly" 2>/dev/null || true
-
-# ── 7. TTS packages ───────────────────────────────────────────────────────────
-echo "[7/9] Installing TTS packages..."
-# chatterbox-tts: install with --no-deps then add its deps manually
-pip install chatterbox-tts --no-deps
+# ── 7. TTS stack ─────────────────────────────────────────────────────────────
+info "[7/10] TTS stack..."
+# chatterbox-tts is intentionally NOT installed:
+#   1. It pins numpy==1.26.0 (causes ResolutionImpossible)
+#   2. It has NO native Telugu language support (English-first)
+#   3. ai4bharat/indic-parler-tts is strictly better for Telugu:
+#      1806h training, 6 emotion params, 69 voices, loaded via transformers
 pip install \
     "TTS>=0.22.0" \
     "gtts>=2.5.0" \
     "soundfile>=0.12.0" \
     "sounddevice>=0.4.6" \
     "librosa>=0.10.0" \
+    "pyloudnorm" \
+    --quiet
+check_numpy
+
+# ── 8. Audio + video utilities ────────────────────────────────────────────────
+info "[8/10] Audio/video utilities..."
+pip install \
     "pedalboard>=0.9.0" \
-    "pydub>=0.25.0"
+    "pydub>=0.25.0" \
+    "scipy>=1.11.0" \
+    "ffmpeg-python>=0.2.0" \
+    "imageio>=2.33.0" \
+    "imageio-ffmpeg>=0.4.9" \
+    --quiet
+check_numpy
 
-# Verify numpy hasn't been upgraded
-NUMPY_VER=$(python -c "import numpy; print(numpy.__version__)")
-echo "    numpy version after TTS install: $NUMPY_VER"
-if [[ "$NUMPY_VER" != "1.26"* ]]; then
-    echo "    WARNING: numpy was upgraded to $NUMPY_VER — re-pinning..."
-    pip install "numpy==1.26.4" --force-reinstall
-fi
-
-# ── 8. Script engine and UI packages ─────────────────────────────────────────
-echo "[8/9] Installing script/UI packages..."
+# ── 9. Script engine + UI ─────────────────────────────────────────────────────
+info "[9/10] Script engine, utilities, Gradio UI..."
 pip install \
     "openai-whisper>=20231117" \
     "faster-whisper>=1.0.0" \
@@ -113,86 +143,71 @@ pip install \
     "youtube-transcript-api>=0.6.0" \
     "requests>=2.31.0" \
     "httpx>=0.27.0" \
+    "sentence-transformers>=2.7.0" \
     "python-dotenv>=1.0.0" \
     "tqdm>=4.66.0" \
     "psutil>=5.9.0" \
     "rich>=13.7.0" \
-    "gradio==4.44.0"
+    "gradio==4.44.0" \
+    --quiet
+check_numpy
 
-# ── 9. Clone animation models ─────────────────────────────────────────────────
-echo "[9/9] Cloning EchoMimicV2 and LatentSync..."
-
+# ── 10. Animation models + weights ───────────────────────────────────────────
+info "[10/10] Cloning animation models..."
 mkdir -p models
 
 if [ ! -d "models/EchoMimicV2" ]; then
-    git clone https://github.com/antgroup/echomimic_v2.git models/EchoMimicV2
-    echo "    EchoMimicV2 cloned."
-else
-    echo "    EchoMimicV2 already exists — skipping."
+    git clone --depth=1 https://github.com/antgroup/echomimic_v2.git models/EchoMimicV2
 fi
 
 if [ ! -d "models/LatentSync" ]; then
-    git clone https://github.com/bytedance/LatentSync.git models/LatentSync
-    echo "    LatentSync cloned."
-else
-    echo "    LatentSync already exists — skipping."
+    git clone --depth=1 https://github.com/bytedance/LatentSync.git models/LatentSync
 fi
 
-# ── Download model weights via HF hub ────────────────────────────────────────
-echo "Downloading model weights from HuggingFace..."
+info "Downloading model weights from HuggingFace (~10-15 min)..."
 python - <<'PYEOF'
 import os
-from huggingface_hub import snapshot_download, hf_hub_download
+from huggingface_hub import snapshot_download
 
 token = os.environ.get("HF_TOKEN")
 os.makedirs("models/weights", exist_ok=True)
 
-# EchoMimicV2 weights
-try:
-    snapshot_download("BadToBest/EchoMimicV2",
-                      local_dir="models/weights/EchoMimicV2",
-                      token=token, ignore_patterns=["*.bin"])
-    print("EchoMimicV2 weights downloaded.")
-except Exception as e:
-    print(f"WARNING: EchoMimicV2 weights failed: {e}")
-
-# LatentSync weights
-try:
-    snapshot_download("ByteDance/LatentSync-1.5",
-                      local_dir="models/weights/LatentSync",
-                      token=token)
-    print("LatentSync weights downloaded.")
-except Exception as e:
-    print(f"WARNING: LatentSync weights failed: {e}")
-
-print("Model download complete.")
+for repo_id, local_dir, ignore in [
+    ("BadToBest/EchoMimicV2",    "models/weights/EchoMimicV2", ["*.bin"]),
+    ("ByteDance/LatentSync-1.5", "models/weights/LatentSync",  []),
+]:
+    try:
+        snapshot_download(repo_id, local_dir=local_dir, token=token,
+                          ignore_patterns=ignore or None)
+        print(f"  OK: {repo_id}")
+    except Exception as e:
+        print(f"  SKIP: {repo_id} — {e}")
 PYEOF
 
 # ── Ollama + Gemma3 ───────────────────────────────────────────────────────────
-echo "Installing Ollama..."
-if ! command -v ollama &> /dev/null; then
+info "Installing Ollama + Gemma3:4b..."
+if ! command -v ollama &>/dev/null; then
     curl -fsSL https://ollama.com/install.sh | sh
 fi
-echo "Starting Ollama service..."
-ollama serve &>/dev/null &
-sleep 5
+pgrep -x ollama >/dev/null || (ollama serve >/dev/null 2>&1 &)
+sleep 6
 ollama pull gemma3:4b
-echo "Gemma3:4b model ready."
 
-# ── Nginx reverse proxy ───────────────────────────────────────────────────────
-echo "Configuring Nginx..."
-sudo apt-get install -y nginx
+# ── Nginx ─────────────────────────────────────────────────────────────────────
+info "Configuring Nginx (port 80 -> 127.0.0.1:7860)..."
+sudo apt-get install -y nginx --quiet
 sudo tee /etc/nginx/sites-available/avatar-studio > /dev/null <<'NGINX'
 server {
     listen 80;
     server_name _;
+    client_max_body_size 50M;
 
     location / {
-        proxy_pass http://127.0.0.1:7860;
+        proxy_pass         http://127.0.0.1:7860;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
@@ -201,17 +216,17 @@ NGINX
 sudo ln -sf /etc/nginx/sites-available/avatar-studio /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl restart nginx
-echo "Nginx configured: port 80 → 127.0.0.1:7860"
 
-# ── Final checks ──────────────────────────────────────────────────────────────
+# ── Final verification ────────────────────────────────────────────────────────
 echo ""
 echo "=== Setup Complete ==="
-echo "GPU:   $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'not detected')"
-echo "numpy: $(python -c 'import numpy; print(numpy.__version__)')"
-echo "torch: $(python -c 'import torch; print(torch.__version__, "| CUDA:", torch.cuda.is_available())')"
+echo "  GPU   : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
+echo "  numpy : $(python -c 'import numpy; print(numpy.__version__)')"
+echo "  torch : $(python -c 'import torch; print(torch.__version__, "| CUDA:", torch.cuda.is_available())')"
+echo "  TTS   : $(python -c 'import TTS; print(TTS.__version__)' 2>/dev/null || echo 'check manually')"
 echo ""
-echo "Next steps:"
-echo "  1. source venv/bin/activate"
-echo "  2. python scripts/generate_avatars.py   # generate Navya + Arjun faces"
-echo "  3. python app.py                         # start the app"
-echo "  4. Open http://YOUR_EC2_PUBLIC_IP in browser"
+echo "Next:"
+echo "  source venv/bin/activate"
+echo "  python scripts/generate_avatars.py"
+echo "  python app.py"
+echo "  Open: http://$(curl -s ifconfig.me 2>/dev/null || echo 'YOUR_EC2_IP')"

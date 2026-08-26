@@ -1,0 +1,3 @@
+# pip constraints — forces these versions even when pulled in as transitive deps
+# Usage: pip install -c constraints.txt <package>
+numpy==1.26.4

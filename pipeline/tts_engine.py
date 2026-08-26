@@ -80,9 +80,10 @@ def synthesize(text: str, voice_profile: str, out_path: Path,
                 success = _synth_gtts(seg, lang, seg_path)
 
         elif engine == "chatterbox":
-            success = _synth_chatterbox(seg, seg_path, ref_audio)
-            if not success:
-                success = _synth_coqui(seg, "en", seg_path, ref_audio)
+            # chatterbox-tts removed: English-only (no Telugu), numpy conflict
+            # Fall through to Coqui for English content
+            log.warning("chatterbox engine requested but not installed — using Coqui fallback")
+            success = _synth_coqui(seg, "en", seg_path, ref_audio)
             if not success:
                 success = _synth_gtts(seg, "en", seg_path)
 
@@ -278,29 +279,12 @@ def _synth_indic(text: str, lang: str, out_path: Path, ref_audio: Optional[Path]
         return False
 
 
-# ── Chatterbox ────────────────────────────────────────────────────────────────
-
-_chatterbox_model = None
-
-def _synth_chatterbox(text: str, out_path: Path, ref_audio: Optional[Path]) -> bool:
-    global _chatterbox_model
-    try:
-        if _chatterbox_model is None:
-            from chatterbox.tts import ChatterboxTTS
-            log.info("Loading Chatterbox TTS...")
-            _chatterbox_model = ChatterboxTTS.from_pretrained(device=DEVICE)
-
-        kwargs = {"exaggeration": 0.5, "cfg_weight": 0.5}
-        if ref_audio and ref_audio.exists():
-            kwargs["audio_prompt_path"] = str(ref_audio)
-
-        wav = _chatterbox_model.generate(text, **kwargs)
-        sf.write(str(out_path), wav.squeeze().cpu().numpy(), _chatterbox_model.sr)
-        return True
-    except Exception as e:
-        log.warning(f"Chatterbox failed: {e}")
-        _chatterbox_model = None
-        return False
+# ── Chatterbox (REMOVED) ──────────────────────────────────────────────────────
+# chatterbox-tts is not installed. Reasons:
+#   1. Pins numpy==1.26.0 — causes ResolutionImpossible with gfpgan, basicsr
+#   2. English-only — no Telugu language support
+#   3. ai4bharat/indic-parler-tts is the correct Telugu TTS (1806h, 6 emotion params)
+# The "chatterbox" engine key falls through to Coqui XTTS in synthesize().
 
 
 # ── Coqui XTTS v2 ─────────────────────────────────────────────────────────────

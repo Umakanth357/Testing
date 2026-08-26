@@ -1,59 +1,67 @@
-# ── IMPORTANT: Do NOT pip install this file directly with one command.
-# ── Use setup.sh which installs in the correct order to avoid numpy conflicts.
-# ── Root cause: chatterbox-tts / basicsr / realesrgan pin numpy<2; torch needs it free.
-# ── Solution: pin numpy==1.26.4 FIRST, then install everything with --no-deps
-#    for the problematic packages.
+# ── INSTALL VIA setup.sh, NOT pip install -r requirements.txt directly ────────
+# This file documents all dependencies. setup.sh installs them in the correct
+# order to avoid numpy conflicts. Direct pip install -r will fail.
+#
+# Root cause of numpy conflict:
+#   - gfpgan <1.3.7 requires numpy<1.23
+#   - chatterbox-tts pins numpy==1.26.0 (English-only anyway, no Telugu support)
+#   - Fix: gfpgan>=1.3.8, drop chatterbox-tts, pin numpy==1.26.4
 
-# ── Core ML (AMI already has PyTorch — skip torch/torchvision/torchaudio here)
+# ── Step 1 — Pinned first, before everything else ─────────────────────────────
+numpy==1.26.4
+
+# ── Step 2 — Core ML (torch/torchvision/torchaudio skipped — AMI already has) ─
 transformers>=4.40.0
-diffusers>=0.27.0
+diffusers>=0.31.0
 accelerate>=0.28.0
 safetensors>=0.4.0
 peft>=0.10.0
+huggingface-hub>=0.22.0
 
-# ── Avatar Generation ─────────────────────────────────────────────────────────
+# ── Step 3 — Image restoration (gfpgan MUST be >=1.3.8 to allow numpy>=1.23) ──
 Pillow>=10.0.0
 opencv-python>=4.9.0
 facexlib>=0.3.0
-# gfpgan / basicsr / realesrgan installed via setup.sh with --no-deps
+basicsr>=1.4.2
+gfpgan>=1.3.8
+realesrgan>=0.3.0
 
-# ── TTS ───────────────────────────────────────────────────────────────────────
-# Indic Parler-TTS: loaded via transformers/HF hub — no pip package needed
-# IndicF5: loaded via transformers/HF hub — LICENSE: verify at huggingface.co/ai4bharat/IndicF5
-# chatterbox-tts installed via setup.sh with --no-deps after numpy pin
+# ── Step 4 — TTS (Indic Parler-TTS + IndicF5 loaded via transformers/HF hub) ──
+# chatterbox-tts REMOVED: English-only, no Telugu, causes numpy conflict
+# Indic Parler-TTS: loaded via transformers — model id: ai4bharat/indic-parler-tts
+# IndicF5: loaded via transformers — model id: ai4bharat/IndicF5
 TTS>=0.22.0
 gtts>=2.5.0
 soundfile>=0.12.0
 sounddevice>=0.4.6
 librosa>=0.10.0
+pyloudnorm
+omegaconf>=2.3.0
 
-# ── Audio Engineering ─────────────────────────────────────────────────────────
+# ── Step 5 — Audio engineering ────────────────────────────────────────────────
 pedalboard>=0.9.0
 pydub>=0.25.0
 scipy>=1.11.0
 
-# ── Video / FFmpeg ────────────────────────────────────────────────────────────
+# ── Step 6 — Video / FFmpeg ───────────────────────────────────────────────────
 ffmpeg-python>=0.2.0
 imageio>=2.33.0
 imageio-ffmpeg>=0.4.9
 
-# ── Script Engine ─────────────────────────────────────────────────────────────
+# ── Step 7 — Script engine ────────────────────────────────────────────────────
 openai-whisper>=20231117
 faster-whisper>=1.0.0
 yt-dlp>=2024.1.0
 youtube-transcript-api>=0.6.0
 requests>=2.31.0
 httpx>=0.27.0
-
-# ── Copyright / Similarity ────────────────────────────────────────────────────
 sentence-transformers>=2.7.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Step 8 — Utilities ────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
-huggingface-hub>=0.22.0
 tqdm>=4.66.0
 psutil>=5.9.0
 rich>=13.7.0
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── Step 9 — UI (install last — most flexible on numpy) ──────────────────────
 gradio==4.44.0
