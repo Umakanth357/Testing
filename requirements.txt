@@ -64,4 +64,6 @@ psutil>=5.9.0
 rich>=13.7.0
 
 # ── Step 9 — UI (install last — most flexible on numpy) ──────────────────────
-gradio==4.44.0
+gradio==4.44.1
+starlette<1.0.0
+edge-tts>=6.1.0

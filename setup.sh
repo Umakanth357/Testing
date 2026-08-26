@@ -148,9 +148,47 @@ pip install \
     "tqdm>=4.66.0" \
     "psutil>=5.9.0" \
     "rich>=13.7.0" \
-    "gradio==4.44.0" \
+    "gradio==4.44.1" \
+    "starlette<1.0.0" \
+    "edge-tts>=6.1.0" \
     --quiet
 check_numpy
+
+# ── Patch gradio_client utils.py (bool schema bug in 4.44.x) ─────────────────
+info "Patching gradio_client for bool additionalProperties schema bug..."
+python3 - <<'PYEOF'
+import sys
+from pathlib import Path
+
+utils_path = None
+for p in sys.path:
+    candidate = Path(p) / "gradio_client" / "utils.py"
+    if candidate.exists():
+        utils_path = candidate
+        break
+
+if not utils_path:
+    print("  SKIP: gradio_client/utils.py not found")
+    sys.exit(0)
+
+txt = utils_path.read_text()
+patched = False
+
+old1 = 'def get_type(schema: dict):\n    if "const" in schema:'
+new1 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict): return "any"\n    if "const" in schema:'
+if old1 in txt:
+    txt = txt.replace(old1, new1)
+    patched = True
+
+old2 = "f\"str, {_json_schema_to_python_type(schema['additionalProperties'], defs)}\""
+new2 = "f\"str, {_json_schema_to_python_type(schema['additionalProperties'], defs) if isinstance(schema['additionalProperties'], dict) else 'any'}\""
+if old2 in txt:
+    txt = txt.replace(old2, new2)
+    patched = True
+
+utils_path.write_text(txt)
+print(f"  {'PATCHED' if patched else 'already patched or not needed'}: {utils_path}")
+PYEOF
 
 # ── 10. Animation models + weights ───────────────────────────────────────────
 info "[10/10] Cloning animation models..."
@@ -216,6 +254,61 @@ NGINX
 sudo ln -sf /etc/nginx/sites-available/avatar-studio /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl restart nginx
+
+# ── HF Auth ──────────────────────────────────────────────────────────────────
+info "Authenticating with HuggingFace..."
+source .env
+export HF_TOKEN=$(grep -i HF_TOKEN .env | sed 's/.*HF_TOKEN[=: ]*//' | tr -d '\r\n ')
+hf auth login --token "$HF_TOKEN" 2>/dev/null || huggingface-cli login --token "$HF_TOKEN" 2>/dev/null || true
+
+# ── Generate backgrounds + avatars ───────────────────────────────────────────
+info "Generating background images..."
+python scripts/download_backgrounds.py
+
+info "Generating avatar images (SDXL, ~5 min)..."
+python scripts/generate_avatars.py
+
+# ── Avatar directory structure (app expects persona_id/pose_attire.png) ───────
+info "Creating avatar directory structure..."
+python3 - <<'PYEOF'
+from pathlib import Path
+import shutil
+
+avatars_dir = Path("models/avatars")
+
+# Map: (persona_dir, pose_attire.png) -> source file
+mappings = [
+    # navya_telugu_f
+    ("navya_telugu_f", "half_body_professional.png",  "navya_professional.png"),
+    ("navya_telugu_f", "half_body_traditional.png",   "navya_traditional.png"),
+    ("navya_telugu_f", "half_body_casual.png",         "navya_casual.png"),
+    ("navya_telugu_f", "standing_professional.png",   "navya_professional.png"),
+    # priya_telugu_f (same avatars as navya)
+    ("priya_telugu_f", "half_body_professional.png",  "navya_professional.png"),
+    ("priya_telugu_f", "half_body_traditional.png",   "navya_traditional.png"),
+    ("priya_telugu_f", "half_body_casual.png",         "navya_casual.png"),
+    # arjun_telugu_m
+    ("arjun_telugu_m", "half_body_professional.png",  "arjun_suit.png"),
+    ("arjun_telugu_m", "half_body_traditional.png",   "arjun_kurta.png"),
+    ("arjun_telugu_m", "half_body_casual.png",         "arjun_casual.png"),
+    ("arjun_telugu_m", "standing_professional.png",   "arjun_suit.png"),
+]
+
+for persona_dir, dest_name, src_name in mappings:
+    dest_dir = avatars_dir / persona_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    src = avatars_dir / src_name
+    dest = dest_dir / dest_name
+    if src.exists() and not dest.exists():
+        shutil.copy2(src, dest)
+        print(f"  COPY {src_name} -> {persona_dir}/{dest_name}")
+    elif dest.exists():
+        print(f"  SKIP {persona_dir}/{dest_name} (exists)")
+    else:
+        print(f"  WARN source not found: {src_name} (run generate_avatars.py first)")
+
+print("Avatar directory structure ready.")
+PYEOF
 
 # ── Final verification ────────────────────────────────────────────────────────
 echo ""

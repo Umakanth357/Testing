@@ -77,6 +77,8 @@ def synthesize(text: str, voice_profile: str, out_path: Path,
             if not success:
                 success = _synth_coqui(seg, lang, seg_path, ref_audio)
             if not success:
+                success = _synth_edge(seg, lang, seg_path, profile.get("gender", "female"))
+            if not success:
                 success = _synth_gtts(seg, lang, seg_path)
 
         elif engine == "chatterbox":
@@ -88,7 +90,9 @@ def synthesize(text: str, voice_profile: str, out_path: Path,
                 success = _synth_gtts(seg, "en", seg_path)
 
         else:
-            success = _synth_gtts(seg, lang, seg_path)
+            success = _synth_edge(seg, lang, seg_path, profile.get("gender", "female"))
+            if not success:
+                success = _synth_gtts(seg, lang, seg_path)
 
         if success:
             segment_files.append(seg_path)
@@ -323,6 +327,42 @@ def _synth_coqui(text: str, lang: str, out_path: Path, ref_audio: Optional[Path]
 
 
 # ── gTTS Fallback ─────────────────────────────────────────────────────────────
+
+def _synth_edge(text: str, lang: str, out_path: Path, gender: str = "female") -> bool:
+    """edge-tts: Microsoft natural voices. Telugu: ShrutiNeural (F), MohanNeural (M).
+    Much more natural than gTTS. Requires internet but no API key."""
+    try:
+        import asyncio
+        import edge_tts
+
+        # Voice map: lang -> (female_voice, male_voice)
+        VOICE_MAP = {
+            "te": ("te-IN-ShrutiNeural", "te-IN-MohanNeural"),
+            "hi": ("hi-IN-SwaraNeural",  "hi-IN-MadhurNeural"),
+            "ta": ("ta-IN-PallaviNeural","ta-IN-ValluvarNeural"),
+            "kn": ("kn-IN-SapnaNeural",  "kn-IN-GaganNeural"),
+            "en": ("en-US-JennyNeural",  "en-US-GuyNeural"),
+            "ml": ("ml-IN-SobhanaNeural","ml-IN-MidhunNeural"),
+        }
+        female_v, male_v = VOICE_MAP.get(lang, ("en-US-JennyNeural", "en-US-GuyNeural"))
+        voice = female_v if gender == "female" else male_v
+
+        mp3_path = out_path.with_suffix(".mp3")
+
+        async def _run():
+            tts = edge_tts.Communicate(text, voice=voice, rate="+0%", pitch="+0Hz")
+            await tts.save(str(mp3_path))
+
+        asyncio.run(_run())
+        audio = AudioSegment.from_mp3(str(mp3_path))
+        audio.export(str(out_path), format="wav")
+        mp3_path.unlink(missing_ok=True)
+        log.info(f"edge-tts OK: {voice}")
+        return True
+    except Exception as e:
+        log.warning(f"edge-tts failed: {e}")
+        return False
+
 
 def _synth_gtts(text: str, lang: str, out_path: Path) -> bool:
     try:
