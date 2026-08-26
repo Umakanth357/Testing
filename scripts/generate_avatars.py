@@ -115,7 +115,7 @@ def load_pipeline():
 
     pipe = FluxPipeline.from_pretrained(
         FLUX_MODEL,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         token=HF_TOKEN,
     )
 
