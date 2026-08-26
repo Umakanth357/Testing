@@ -127,7 +127,9 @@ def load_pipeline():
     except Exception as e:
         print(f"  LoRA load failed ({e}) — continuing without LoRA (quality may be lower)")
 
-    pipe = pipe.to(DEVICE)
+    # T4 has 15.6GB VRAM; FLUX full pipeline ~13-14GB in float16.
+    # Use sequential CPU offload so transformer stays on GPU, encoders move to RAM.
+    pipe.enable_model_cpu_offload()   # moves unused sub-models to CPU between steps
 
     if DEVICE == "cuda":
         pipe.enable_attention_slicing()
