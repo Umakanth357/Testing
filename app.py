@@ -17,15 +17,24 @@ from datetime import datetime
 from typing import Optional
 
 # ── Gradio 4.44.0 bug fix (must be before `import gradio`) ───────────────────
-# gradio_client.utils.get_type crashes with TypeError when schema is a bool
-# (e.g. additionalProperties: true/false). Monkey-patch before gradio loads.
+# gradio_client.utils crashes when a JSON schema field is a plain bool
+# (e.g. additionalProperties: true). Both get_type() and the inner recursive
+# _json_schema_to_python_type() must handle non-dict schemas gracefully.
 import gradio_client.utils as _gcu_patch
+
 _gcu_orig_get_type = _gcu_patch.get_type
 def _gcu_safe_get_type(schema):
     if not isinstance(schema, dict):
         return "any"
     return _gcu_orig_get_type(schema)
 _gcu_patch.get_type = _gcu_safe_get_type
+
+_gcu_orig_inner = _gcu_patch._json_schema_to_python_type
+def _gcu_safe_inner(schema, defs=None):
+    if not isinstance(schema, dict):
+        return "any"
+    return _gcu_orig_inner(schema, defs)
+_gcu_patch._json_schema_to_python_type = _gcu_safe_inner
 # ─────────────────────────────────────────────────────────────────────────────
 
 import gradio as gr
