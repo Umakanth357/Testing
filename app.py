@@ -217,7 +217,7 @@ def generate_video(
         progress(0.10, desc="Generating voice...")
         # Character bible overrides generic AVATARS config for Kavya/Arjun
         tts_cfg   = get_tts_config(character_id) if character_id in ("navya", "arjun") else {}
-        profile   = tts_cfg.get("engine", AVATARS[persona_id]["voice_profile"])
+        profile   = AVATARS[persona_id]["voice_profile"]
         ref_wav   = (ROOT / tts_cfg["ref_audio"]) if tts_cfg.get("ref_audio") else None
         if ref_wav and not ref_wav.exists():
             ref_wav = None
