@@ -1,443 +1,271 @@
 """
-TTS Engine — Text to speech with emotion, breathing, and voice cloning.
+tts_engine.py — Text-to-Speech pipeline
 
 Priority chain:
-  Indic languages: IndicF5 → Coqui XTTS v2 → gTTS
-  English:         Chatterbox → Coqui XTTS v2 → gTTS
+  1. edge-tts (Microsoft Azure Neural)  — PRIMARY. Fast, natural, Telugu/Hindi/Tamil/Kannada.
+                                          No API key. Free. Async HTTP. ~2-5s for 3min audio.
+  2. Indic Parler-TTS (ai4bharat)       — Best quality. 1806h Telugu, 6 emotion params.
+                                          Needs HF gated access approval + 4GB model.
+  3. gTTS                               — Last resort. Always works. Robotic but reliable.
+
+Speed: edge-tts produces 3min of audio in ~3 seconds. It is the right choice.
+
+Post-processing (always applied):
+  - Normalise loudness to -14 LUFS (broadcast standard)
+  - Optional room acoustics (pedalboard reverb)
 """
-import re
+import asyncio
 import logging
-import tempfile
+import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import soundfile as sf
-from pydub import AudioSegment
-
-from config import VOICES_DIR, VOICE_PROFILES, INDIC_TTS_MODEL, DEVICE
-
 log = logging.getLogger("tts_engine")
 
-# Silence durations (ms)
-BREATH_PAUSE_MS  = 350   # [breath] marker
-COMMA_PAUSE_MS   = 180
-PERIOD_PAUSE_MS  = 400
-ELLIPSIS_PAUSE_MS = 600
+# ── Voice map: lang × gender → Microsoft Neural voice ────────────────────────
+EDGE_VOICES = {
+    "te": {"female": "te-IN-ShrutiNeural",  "male": "te-IN-MohanNeural"},
+    "hi": {"female": "hi-IN-SwaraNeural",   "male": "hi-IN-MadhurNeural"},
+    "ta": {"female": "ta-IN-PallaviNeural", "male": "ta-IN-ValluvarNeural"},
+    "kn": {"female": "kn-IN-SapnaNeural",   "male": "kn-IN-GaganNeural"},
+    "ml": {"female": "ml-IN-SobhanaNeural", "male": "ml-IN-MidhunNeural"},
+    "mr": {"female": "mr-IN-AarohiNeural",  "male": "mr-IN-ManoharNeural"},
+    "bn": {"female": "bn-IN-TanishaaNeural","male": "bn-IN-BashkarNeural"},
+    "en": {"female": "en-US-JennyNeural",   "male": "en-US-GuyNeural"},
+}
+
+# Voice profile → (lang, gender, speaking_rate_offset, pitch_offset_hz)
+PROFILE_CONFIG = {
+    "te_female_professional": ("te", "female", "+0%",  "+0Hz"),
+    "te_male_professional":   ("te", "male",   "-5%",  "-5Hz"),
+    "ta_male_professional":   ("ta", "male",   "-5%",  "-3Hz"),
+    "kn_female_professional": ("kn", "female", "+0%",  "+0Hz"),
+    "hi_female_professional": ("hi", "female", "+0%",  "+0Hz"),
+    "en_male_professional":   ("en", "male",   "-5%",  "-5Hz"),
+    "en_female_professional": ("en", "female", "+0%",  "+0Hz"),
+}
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── edge-tts (PRIMARY) ────────────────────────────────────────────────────────
 
-def synthesize(text: str, voice_profile: str, out_path: Path,
-               ref_audio: Optional[Path] = None) -> bool:
-    """
-    Main TTS entry point.
-    Returns True if audio was generated successfully, False otherwise.
-    """
-    profile = VOICE_PROFILES.get(voice_profile)
-    if not profile:
-        log.error(f"Unknown voice profile: {voice_profile}")
+async def _edge_async(text: str, voice: str, mp3_path: Path, rate: str, pitch: str) -> bool:
+    """Core async edge-tts call. Saves MP3, returns success."""
+    try:
+        import edge_tts
+        comm = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+        await comm.save(str(mp3_path))
+        return mp3_path.exists() and mp3_path.stat().st_size > 1024
+    except Exception as e:
+        log.warning(f"edge-tts async failed: {e}")
         return False
 
-    # Inject breathing pauses and normalise text
-    prepared = _prepare_text(text)
-    segments  = _split_into_segments(prepared)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="tts_"))
+def _synth_edge(text: str, profile: str, out_wav: Path) -> bool:
+    """Synthesize via edge-tts. MP3 → WAV via FFmpeg."""
+    lang, gender, rate, pitch = PROFILE_CONFIG.get(
+        profile, ("te", "female", "+0%", "+0Hz")
+    )
+    voice = EDGE_VOICES.get(lang, EDGE_VOICES["en"])[gender]
+    mp3_path = out_wav.with_suffix(".mp3")
+    log.info(f"edge-tts | voice={voice} rate={rate}")
 
-    engine  = profile["engine"]
-    lang    = profile["lang"]
-
-    # Auto-select reference audio from voices dir if not provided
-    if ref_audio is None:
-        candidates = list(VOICES_DIR.glob(f"{lang}_*.wav")) + list(VOICES_DIR.glob(f"*.wav"))
-        if candidates:
-            ref_audio = candidates[0]
-            log.info(f"Using voice reference: {ref_audio.name}")
-
-    segment_files = []
-    for i, seg in enumerate(segments):
-        if not seg.strip() or seg == "[breath]":
-            # Generate silence
-            seg_path = tmp_dir / f"seg_{i:04d}.wav"
-            _write_silence(seg_path, BREATH_PAUSE_MS if seg == "[breath]" else COMMA_PAUSE_MS)
-            segment_files.append(seg_path)
-            continue
-
-        seg_path = tmp_dir / f"seg_{i:04d}.wav"
-        success = False
-
-        if engine == "indic":
-            # Indic Parler-TTS first (emotion + pitch + speed control, 1806h training)
-            success = _synth_parler(seg, lang, seg_path, profile)
-            if not success:
-                # IndicF5 fallback (1417h, voice cloning, no style params)
-                success = _synth_indic(seg, lang, seg_path, ref_audio)
-            if not success:
-                success = _synth_coqui(seg, lang, seg_path, ref_audio)
-            if not success:
-                success = _synth_edge(seg, lang, seg_path, profile.get("gender", "female"))
-            if not success:
-                success = _synth_gtts(seg, lang, seg_path)
-
-        elif engine == "chatterbox":
-            # chatterbox-tts removed: English-only (no Telugu), numpy conflict
-            # Fall through to Coqui for English content
-            log.warning("chatterbox engine requested but not installed — using Coqui fallback")
-            success = _synth_coqui(seg, "en", seg_path, ref_audio)
-            if not success:
-                success = _synth_gtts(seg, "en", seg_path)
-
-        else:
-            success = _synth_edge(seg, lang, seg_path, profile.get("gender", "female"))
-            if not success:
-                success = _synth_gtts(seg, lang, seg_path)
-
-        if success:
-            segment_files.append(seg_path)
-        else:
-            log.error(f"All TTS engines failed for segment: {seg[:50]}")
-
-    if not segment_files:
-        log.error("No audio segments generated")
+    ok = asyncio.run(_edge_async(text, voice, mp3_path, rate, pitch))
+    if not ok:
         return False
 
-    # Concatenate all segments
-    _concatenate_wavs(segment_files, out_path)
-    log.info(f"TTS complete: {out_path} ({out_path.stat().st_size // 1024}KB)")
-    return True
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(mp3_path), "-ar", "44100", "-ac", "1", str(out_wav)],
+        capture_output=True, timeout=60,
+    )
+    mp3_path.unlink(missing_ok=True)
+    success = r.returncode == 0 and out_wav.exists() and out_wav.stat().st_size > 1024
+    if not success:
+        log.error(f"FFmpeg MP3→WAV: {r.stderr.decode()[:200]}")
+    return success
 
 
-# ── Text Preparation ──────────────────────────────────────────────────────────
+# ── Indic Parler-TTS (OPTIONAL HIGH QUALITY) ──────────────────────────────────
 
-def _prepare_text(text: str) -> str:
-    """Clean text, inject breathing markers before long sentences."""
-    # Normalise whitespace
-    text = re.sub(r'\s+', ' ', text.strip())
-    # Remove existing stage directions in brackets (we add our own)
-    text = re.sub(r'\[(?!breath)[^\]]+\]', '', text)
+_PARLER_MODEL = None
+_PARLER_TOKENIZER = None
 
-    # Inject [breath] before sentences longer than 15 words
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    result = []
-    for i, sent in enumerate(sentences):
-        word_count = len(sent.split())
-        if i > 0 and word_count > 15:
-            result.append("[breath]")
-        result.append(sent)
-
-    return " ".join(result)
-
-
-def _split_into_segments(text: str) -> list[str]:
-    """
-    Split prepared text into TTS-safe segments.
-    Splits on: [breath], sentence boundaries, commas.
-    """
-    # Split on [breath] markers first
-    parts = re.split(r'\[breath\]', text)
-    segments = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        segments.append("[breath]")  # insert pause between parts
-        # Split long parts on sentence boundaries
-        sentences = re.split(r'(?<=[.!?])\s+', part)
-        for sent in sentences:
-            sent = sent.strip()
-            if sent:
-                segments.append(sent)
-
-    # Remove leading [breath]
-    while segments and segments[0] == "[breath]":
-        segments.pop(0)
-
-    return segments
-
-
-# ── Indic Parler-TTS (Primary for Indic languages) ───────────────────────────
-# Research confirmed: 1,806h training, 6 controllable params (Pitch, Speed,
-# Expressivity, Voice Quality, Reverb, Background Noise), 69 voices.
-# Superior to IndicF5 for emotion-expressive content.
-
-_parler_model     = None
-_parler_tokenizer = None
-
-# Character-specific voice descriptions for Indic Parler-TTS
-PARLER_VOICE_DESCRIPTIONS = {
-    "navya": (
-        "Navya speaks with a sweet, clear, medium-high-pitched Telugu female voice. "
-        "Her delivery is confident and medium-fast with high expressivity and natural prosody. "
-        "Voice quality is bright and smooth, with a strong conviction tone. "
-        "Background noise is minimal. Reverberation is slight, like a well-treated recording studio."
+_PARLER_DESCRIPTIONS = {
+    "te_female_professional": (
+        "A warm, confident South Indian Telugu woman speaks professionally. "
+        "Clear pronunciation, engaging tone, studio quality."
     ),
-    "arjun": (
-        "Arjun speaks with a deep baritone Telugu male voice. "
-        "His delivery is deliberate and measured with controlled expressivity. "
-        "Voice quality is authoritative and clear. Background noise is none. "
-        "Reverberation is minimal, like a professional broadcast studio."
-    ),
-    "default": (
-        "The speaker has a clear, natural Indian voice with neutral expressivity. "
-        "Delivery is medium pace. Voice quality is clean. No background noise."
+    "te_male_professional": (
+        "A deep, authoritative Telugu man speaks calmly and professionally. "
+        "Moderate pace, clear and articulate, studio quality."
     ),
 }
 
 
-def _synth_parler(text: str, lang: str, out_path: Path, profile: dict) -> bool:
-    """
-    Indic Parler-TTS synthesis with character-specific voice description.
-    Supports Telugu, Hindi, Kannada, Tamil, and 17 more Indic languages.
-    """
-    global _parler_model, _parler_tokenizer
+def _load_parler() -> bool:
+    global _PARLER_MODEL, _PARLER_TOKENIZER
+    if _PARLER_MODEL is not None:
+        return True
     try:
-        from transformers import AutoTokenizer, AutoModelForTextToSpeech
+        import torch
+        from transformers import AutoTokenizer
+        from parler_tts import ParlerTTSForConditionalGeneration
+        model_id = "ai4bharat/indic-parler-tts"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        _PARLER_MODEL = ParlerTTSForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=dtype
+        ).to(device)
+        _PARLER_TOKENIZER = AutoTokenizer.from_pretrained(model_id)
+        log.info(f"Parler-TTS loaded on {device}")
+        return True
+    except Exception as e:
+        log.warning(f"Parler-TTS unavailable: {e}")
+        return False
+
+
+def _synth_parler(text: str, profile: str, out_wav: Path) -> bool:
+    if not _load_parler():
+        return False
+    try:
         import torch, soundfile as sf
-
-        if _parler_model is None:
-            log.info("Loading Indic Parler-TTS (primary Indic TTS)...")
-            model_id = "ai4bharat/indic-parler-tts"
-            _parler_tokenizer = AutoTokenizer.from_pretrained(model_id)
-            _parler_model     = AutoModelForTextToSpeech.from_pretrained(
-                model_id, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
-            )
-            if DEVICE == "cuda":
-                _parler_model = _parler_model.cuda()
-            _parler_model.eval()
-            log.info("Indic Parler-TTS loaded.")
-
-        # Get character voice description from profile (falls back to default)
-        char_id      = profile.get("character_id", "default")
-        description  = PARLER_VOICE_DESCRIPTIONS.get(char_id, PARLER_VOICE_DESCRIPTIONS["default"])
-
-        # Add language cue
-        lang_name_map = {"te": "Telugu", "hi": "Hindi", "kn": "Kannada",
-                         "ta": "Tamil", "ml": "Malayalam", "mr": "Marathi"}
-        lang_name = lang_name_map.get(lang, "Telugu")
-        description = f"[{lang_name}] " + description
-
-        with torch.no_grad():
-            desc_inputs  = _parler_tokenizer(description, return_tensors="pt")
-            text_inputs  = _parler_tokenizer(text, return_tensors="pt")
-
-            if DEVICE == "cuda":
-                desc_inputs  = {k: v.cuda() for k, v in desc_inputs.items()}
-                text_inputs  = {k: v.cuda() for k, v in text_inputs.items()}
-
-            generation = _parler_model.generate(
-                input_ids           = desc_inputs["input_ids"],
-                prompt_input_ids    = text_inputs["input_ids"],
-                attention_mask      = desc_inputs.get("attention_mask"),
-                prompt_attention_mask = text_inputs.get("attention_mask"),
-            )
-
-        audio_arr = generation.cpu().numpy().squeeze()
-        sr = _parler_model.config.sampling_rate if hasattr(_parler_model.config, "sampling_rate") else 44100
-        sf.write(str(out_path), audio_arr, sr)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        desc = _PARLER_DESCRIPTIONS.get(
+            profile, "A professional voice speaking clearly. Studio quality."
+        )
+        inp = _PARLER_TOKENIZER(desc, return_tensors="pt").input_ids.to(device)
+        pmt = _PARLER_TOKENIZER(text, return_tensors="pt").input_ids.to(device)
+        with torch.inference_mode():
+            gen = _PARLER_MODEL.generate(input_ids=inp, prompt_input_ids=pmt)
+        audio = gen.cpu().numpy().squeeze()
+        sf.write(str(out_wav), audio, _PARLER_MODEL.config.sampling_rate)
+        log.info(f"Parler-TTS OK → {out_wav}")
         return True
-
     except Exception as e:
-        log.warning(f"Indic Parler-TTS failed: {e}")
-        _parler_model     = None
-        _parler_tokenizer = None
+        log.error(f"Parler-TTS synthesis: {e}")
         return False
 
 
-# ── IndicF5 (Fallback) ────────────────────────────────────────────────────────
+# ── gTTS (LAST RESORT) ────────────────────────────────────────────────────────
 
-_indic_pipeline = None
-
-def _synth_indic(text: str, lang: str, out_path: Path, ref_audio: Optional[Path]) -> bool:
-    global _indic_pipeline
-    try:
-        if _indic_pipeline is None:
-            from transformers import pipeline
-            log.info("Loading IndicF5 model...")
-            _indic_pipeline = pipeline(
-                "text-to-speech",
-                model=INDIC_TTS_MODEL,
-                device=0 if DEVICE == "cuda" else -1,
-            )
-
-        # IndicF5 expects language prefix in some variants
-        lang_prefixed = f"[{lang}] {text}" if lang != "en" else text
-
-        kwargs = {}
-        if ref_audio and ref_audio.exists():
-            # Zero-shot voice cloning
-            kwargs["forward_params"] = {"reference_audio": str(ref_audio)}
-
-        output = _indic_pipeline(lang_prefixed, **kwargs)
-        audio  = output["audio"]
-        sr     = output["sampling_rate"]
-
-        if audio.ndim > 1:
-            audio = audio.squeeze()
-        sf.write(str(out_path), audio, sr)
-        return True
-    except Exception as e:
-        log.warning(f"IndicF5 failed: {e}")
-        _indic_pipeline = None  # Reset so next call retries load
-        return False
-
-
-# ── Chatterbox (REMOVED) ──────────────────────────────────────────────────────
-# chatterbox-tts is not installed. Reasons:
-#   1. Pins numpy==1.26.0 — causes ResolutionImpossible with gfpgan, basicsr
-#   2. English-only — no Telugu language support
-#   3. ai4bharat/indic-parler-tts is the correct Telugu TTS (1806h, 6 emotion params)
-# The "chatterbox" engine key falls through to Coqui XTTS in synthesize().
-
-
-# ── Coqui XTTS v2 ─────────────────────────────────────────────────────────────
-
-_coqui_model = None
-
-def _synth_coqui(text: str, lang: str, out_path: Path, ref_audio: Optional[Path]) -> bool:
-    global _coqui_model
-    try:
-        if _coqui_model is None:
-            from TTS.api import TTS
-            log.info("Loading Coqui XTTS v2...")
-            _coqui_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(DEVICE)
-
-        # XTTS v2 supported languages
-        lang_map = {"te": "te", "kn": "kn", "ta": "ta", "hi": "hi",
-                    "en": "en", "ml": "ml", "mr": "mr", "bn": "bn"}
-        tts_lang = lang_map.get(lang, "en")
-
-        if ref_audio and ref_audio.exists():
-            _coqui_model.tts_to_file(
-                text=text, language=tts_lang,
-                speaker_wav=str(ref_audio),
-                file_path=str(out_path),
-            )
-        else:
-            _coqui_model.tts_to_file(
-                text=text, language=tts_lang,
-                file_path=str(out_path),
-            )
-        return True
-    except Exception as e:
-        log.warning(f"Coqui XTTS failed: {e}")
-        _coqui_model = None
-        return False
-
-
-# ── gTTS Fallback ─────────────────────────────────────────────────────────────
-
-def _synth_edge(text: str, lang: str, out_path: Path, gender: str = "female") -> bool:
-    """edge-tts: Microsoft natural voices. Telugu: ShrutiNeural (F), MohanNeural (M).
-    Much more natural than gTTS. Requires internet but no API key."""
-    try:
-        import asyncio
-        import edge_tts
-
-        # Voice map: lang -> (female_voice, male_voice)
-        VOICE_MAP = {
-            "te": ("te-IN-ShrutiNeural", "te-IN-MohanNeural"),
-            "hi": ("hi-IN-SwaraNeural",  "hi-IN-MadhurNeural"),
-            "ta": ("ta-IN-PallaviNeural","ta-IN-ValluvarNeural"),
-            "kn": ("kn-IN-SapnaNeural",  "kn-IN-GaganNeural"),
-            "en": ("en-US-JennyNeural",  "en-US-GuyNeural"),
-            "ml": ("ml-IN-SobhanaNeural","ml-IN-MidhunNeural"),
-        }
-        female_v, male_v = VOICE_MAP.get(lang, ("en-US-JennyNeural", "en-US-GuyNeural"))
-        voice = female_v if gender == "female" else male_v
-
-        mp3_path = out_path.with_suffix(".mp3")
-
-        async def _run():
-            tts = edge_tts.Communicate(text, voice=voice, rate="+0%", pitch="+0Hz")
-            await tts.save(str(mp3_path))
-
-        asyncio.run(_run())
-        audio = AudioSegment.from_mp3(str(mp3_path))
-        audio.export(str(out_path), format="wav")
-        mp3_path.unlink(missing_ok=True)
-        log.info(f"edge-tts OK: {voice}")
-        return True
-    except Exception as e:
-        log.warning(f"edge-tts failed: {e}")
-        return False
-
-
-def _synth_gtts(text: str, lang: str, out_path: Path) -> bool:
+def _synth_gtts(text: str, profile: str, out_wav: Path) -> bool:
     try:
         from gtts import gTTS
-        lang_map = {"te": "te", "kn": "kn", "ta": "ta", "hi": "hi",
-                    "en": "en", "ml": "ml", "mr": "mr", "bn": "bn"}
-        tts_lang = lang_map.get(lang, "en")
-        tts = gTTS(text=text, lang=tts_lang, slow=False)
-        mp3_path = out_path.with_suffix(".mp3")
-        tts.save(str(mp3_path))
-        # Convert MP3 → WAV
-        audio = AudioSegment.from_mp3(str(mp3_path))
-        audio.export(str(out_path), format="wav")
-        mp3_path.unlink(missing_ok=True)
-        return True
+        lang = PROFILE_CONFIG.get(profile, ("te",))[0]
+        mp3 = out_wav.with_suffix(".mp3")
+        gTTS(text=text, lang=lang, slow=False).save(str(mp3))
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(mp3), "-ar", "44100", "-ac", "1", str(out_wav)],
+            capture_output=True, timeout=60,
+        )
+        mp3.unlink(missing_ok=True)
+        log.info(f"gTTS fallback OK → {out_wav}")
+        return out_wav.exists() and out_wav.stat().st_size > 1024
     except Exception as e:
-        log.warning(f"gTTS failed: {e}")
+        log.error(f"gTTS failed: {e}")
         return False
 
 
-# ── Audio Utilities ───────────────────────────────────────────────────────────
+# ── Pre-processing ────────────────────────────────────────────────────────────
 
-def _write_silence(path: Path, duration_ms: int) -> None:
-    silence = AudioSegment.silent(duration=duration_ms)
-    silence.export(str(path), format="wav")
-
-
-def _concatenate_wavs(files: list[Path], out_path: Path) -> None:
-    combined = AudioSegment.empty()
-    for f in files:
-        try:
-            seg = AudioSegment.from_wav(str(f))
-            combined += seg
-        except Exception as e:
-            log.warning(f"Skip corrupt segment {f.name}: {e}")
-    # Normalise to -16 LUFS (broadcast standard)
-    combined = _normalise(combined)
-    combined.export(str(out_path), format="wav")
+def preprocess_text(text: str) -> str:
+    """Clean script text for TTS: remove stage directions, speaker labels, normalise whitespace."""
+    text = re.sub(r'^(NAVYA|ARJUN|SPEAKER_[AB]):\s*', '', text, flags=re.MULTILINE | re.I)
+    text = re.sub(r'\[.*?\]|\(.*?\)', ' ', text)
+    text = text.replace('...', ',')
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def _normalise(audio: AudioSegment, target_dBFS: float = -16.0) -> AudioSegment:
-    diff = target_dBFS - audio.dBFS
-    return audio.apply_gain(diff)
+# ── Post-processing ───────────────────────────────────────────────────────────
 
-
-def add_room_acoustics(audio_path: Path, reverb_type: str, out_path: Path) -> bool:
-    """Apply room acoustics using Pedalboard. Returns True on success."""
+def normalise_loudness(wav_in: Path, wav_out: Path, target_lufs: float = -14.0) -> bool:
+    """Normalise loudness to -14 LUFS (broadcast standard) via FFmpeg loudnorm."""
     try:
-        from pedalboard import Pedalboard, Reverb, HighpassFilter, LowpassFilter, Compressor
-        import soundfile as sf
-
-        REVERB_PRESETS = {
-            "dead":        Reverb(room_size=0.0, damping=1.0, wet_level=0.0),
-            "small_room":  Reverb(room_size=0.15, damping=0.7, wet_level=0.08),
-            "medium_room": Reverb(room_size=0.3,  damping=0.6, wet_level=0.12),
-            "large_hall":  Reverb(room_size=0.7,  damping=0.4, wet_level=0.20),
-            "outdoors":    Reverb(room_size=0.5,  damping=0.3, wet_level=0.10),
-        }
-
-        reverb = REVERB_PRESETS.get(reverb_type, REVERB_PRESETS["small_room"])
-        board  = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=80),   # Remove low rumble
-            Compressor(threshold_db=-18, ratio=3.0),  # Even dynamics
-            reverb,
-            LowpassFilter(cutoff_frequency_hz=14000), # Natural roll-off
-        ])
-
-        audio, sr = sf.read(str(audio_path))
-        if audio.ndim == 1:
-            audio = audio.reshape(-1, 1)
-        processed = board(audio.T, sr).T
-        sf.write(str(out_path), processed, sr)
-        return True
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_in),
+             "-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
+             "-ar", "44100", "-ac", "1", str(wav_out)],
+            capture_output=True, timeout=120,
+        )
+        return r.returncode == 0 and wav_out.exists()
     except Exception as e:
-        log.warning(f"Room acoustics failed: {e} — using raw audio")
-        import shutil
-        shutil.copy(audio_path, out_path)
+        log.warning(f"Loudnorm failed: {e}")
         return False
+
+
+def add_room_acoustics(wav_in: Path, reverb_type: str, wav_out: Path) -> bool:
+    """Add subtle room reverb via FFmpeg aecho filter."""
+    PARAMS = {
+        "dead":        None,
+        "small_room":  "0.8:0.88:60:0.4",
+        "medium_room": "0.8:0.88:100:0.5",
+        "large_hall":  "0.8:0.88:200:0.7",
+        "outdoors":    "0.8:0.88:80:0.3",
+    }
+    params = PARAMS.get(reverb_type)
+    if params is None:
+        subprocess.run(["ffmpeg", "-y", "-i", str(wav_in), str(wav_out)], capture_output=True)
+        return wav_out.exists()
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_in), "-af", f"aecho={params}", str(wav_out)],
+            capture_output=True, timeout=60,
+        )
+        return r.returncode == 0 and wav_out.exists()
+    except Exception as e:
+        log.warning(f"Room acoustics failed: {e}")
+        import shutil; shutil.copy2(str(wav_in), str(wav_out))
+        return True
+
+
+# ── Main synthesize() ─────────────────────────────────────────────────────────
+
+def synthesize(
+    text: str,
+    voice_profile: str,
+    out_path: Path,
+    ref_audio: Optional[str] = None,
+    use_parler: bool = False,
+) -> bool:
+    """
+    Main synthesis entrypoint.
+    Chain: edge-tts (primary) → Parler-TTS (if use_parler) → gTTS (fallback).
+    Returns True if audio generated successfully.
+    """
+    if not text.strip():
+        log.error("synthesize: empty text")
+        return False
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    clean = preprocess_text(text)
+    raw = out_path.with_stem(out_path.stem + "_raw")
+
+    success = False
+
+    if use_parler:
+        log.info("Trying Parler-TTS (high quality)...")
+        success = _synth_parler(clean, voice_profile, raw)
+
+    if not success:
+        log.info("Trying edge-tts (Microsoft Neural)...")
+        success = _synth_edge(clean, voice_profile, raw)
+
+    if not success:
+        log.warning("edge-tts failed — gTTS fallback")
+        success = _synth_gtts(clean, voice_profile, raw)
+
+    if not success:
+        log.error("All TTS engines failed")
+        return False
+
+    ok = normalise_loudness(raw, out_path)
+    if not ok:
+        import shutil; shutil.copy2(str(raw), str(out_path))
+
+    raw.unlink(missing_ok=True)
+    final_ok = out_path.exists() and out_path.stat().st_size > 1024
+    if final_ok:
+        log.info(f"TTS done: {out_path} ({out_path.stat().st_size//1024}KB)")
+    return final_ok

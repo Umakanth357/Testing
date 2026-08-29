@@ -190,46 +190,66 @@ utils_path.write_text(txt)
 print(f"  {'PATCHED' if patched else 'already patched or not needed'}: {utils_path}")
 PYEOF
 
-# ── 10. Animation models + weights ───────────────────────────────────────────
-info "[10/10] Cloning animation models..."
+# ── 10. MuseTalk (lip sync — primary) ────────────────────────────────────────
+# MuseTalk by ByteDance — best open-source lip sync 2025
+# Apache 2.0 license, real-time on T4 (~30fps), preserves full face quality
+# Total: ~3.5GB weights
+info "[10/10] Installing MuseTalk lip sync..."
 mkdir -p models
 
-if [ ! -d "models/EchoMimicV2" ]; then
-    git clone --depth=1 https://github.com/antgroup/echomimic_v2.git models/EchoMimicV2
+if [ ! -d "models/MuseTalk" ]; then
+    info "Cloning MuseTalk..."
+    git clone --depth=1 https://github.com/TMElyralab/MuseTalk.git models/MuseTalk
 fi
 
-if [ ! -d "models/LatentSync" ]; then
-    git clone --depth=1 https://github.com/bytedance/LatentSync.git models/LatentSync
+# Install MuseTalk Python dependencies
+if [ -f "models/MuseTalk/requirements.txt" ]; then
+    info "Installing MuseTalk requirements..."
+    pip install -r models/MuseTalk/requirements.txt --quiet 2>/dev/null || \
+        warn "Some MuseTalk deps failed — non-blocking"
 fi
 
-info "Downloading model weights from HuggingFace (~10-15 min)..."
-python - <<'PYEOF'
+# Download MuseTalk weights
+info "Downloading MuseTalk weights from HuggingFace (~3.5GB, ~5-10 min)..."
+python3 - <<'PYEOF'
 import os
+from pathlib import Path
 from huggingface_hub import snapshot_download
 
 token = os.environ.get("HF_TOKEN")
-os.makedirs("models/weights", exist_ok=True)
+weights_dir = Path("models/MuseTalk/models")
+weights_dir.mkdir(parents=True, exist_ok=True)
 
-for repo_id, local_dir, ignore in [
-    ("BadToBest/EchoMimicV2",    "models/weights/EchoMimicV2", ["*.bin"]),
-    ("ByteDance/LatentSync-1.5", "models/weights/LatentSync",  []),
-]:
+repos = [
+    ("TMElyralab/MuseTalk",         str(weights_dir),            []),
+    ("stabilityai/sd-vae-ft-mse",   str(weights_dir / "sd-vae-ft-mse"), []),
+]
+for repo_id, local_dir, ignore in repos:
     try:
-        snapshot_download(repo_id, local_dir=local_dir, token=token,
-                          ignore_patterns=ignore or None)
+        snapshot_download(
+            repo_id, local_dir=local_dir, token=token,
+            ignore_patterns=ignore or None
+        )
         print(f"  OK: {repo_id}")
     except Exception as e:
-        print(f"  SKIP: {repo_id} — {e}")
+        print(f"  WARN: {repo_id} — {e} (non-blocking)")
 PYEOF
 
-# ── Ollama + Gemma3 ───────────────────────────────────────────────────────────
-info "Installing Ollama + Gemma3:4b..."
+# Also install instaloader as yt-dlp backup for Instagram
+pip install instaloader --quiet 2>/dev/null || true
+
+# ── Ollama + llama3.1:8b ─────────────────────────────────────────────────────
+# Switched from gemma3:4b → llama3.1:8b for better Telugu/Indic script quality.
+# 8B model is ~5GB vs 4B model's 2.5GB but produces significantly better scripts.
+info "Installing Ollama + llama3.1:8b..."
 if ! command -v ollama &>/dev/null; then
     curl -fsSL https://ollama.com/install.sh | sh
 fi
 pgrep -x ollama >/dev/null || (ollama serve >/dev/null 2>&1 &)
 sleep 6
-ollama pull gemma3:4b
+ollama pull llama3.1:8b
+# Keep gemma3:4b as fast fallback (small tasks, fast response)
+ollama pull gemma3:4b || true
 
 # ── Nginx ─────────────────────────────────────────────────────────────────────
 info "Configuring Nginx (port 80 -> 127.0.0.1:7860)..."

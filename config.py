@@ -45,10 +45,10 @@ FLUX_MODEL       = "black-forest-labs/FLUX.1-schnell"   # Apache 2.0 — commerc
 FLUX_LORA        = "prithivMLmods/Desi-Espresso-Flux"   # South Indian faces LoRA
 FLUX_STEPS       = 4                                    # schnell needs only 4 steps
 
-WHISPER_MODEL    = "large-v3"
-OLLAMA_MODEL     = "gemma3:4b"
+WHISPER_MODEL    = "small"             # small=244MB, fast, good for Telugu
+OLLAMA_MODEL     = "llama3.1:8b"       # 8B = much better Telugu/script quality vs gemma3:4b
 OLLAMA_URL       = "http://localhost:11434"
-OLLAMA_TIMEOUT   = 120
+OLLAMA_TIMEOUT   = 180                 # 8B model needs more time
 
 INDIC_TTS_MODEL        = "ai4bharat/IndicF5"           # Fallback: 11 languages, voice cloning
 INDIC_PARLER_TTS_MODEL = "ai4bharat/indic-parler-tts"  # Primary: 6 emotion params, 69 voices, 1806h
