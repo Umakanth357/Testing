@@ -54,6 +54,10 @@ INDIC_TTS_MODEL        = "ai4bharat/IndicF5"           # Fallback: 11 languages,
 INDIC_PARLER_TTS_MODEL = "ai4bharat/indic-parler-tts"  # Primary: 6 emotion params, 69 voices, 1806h
 REALESRGAN_MODEL = "RealESRGAN_x4plus"
 
+# ── Lip Sync Pipeline ──────────────────────────────────────────────────────────
+SADTALKER_DIR   = ROOT / "models" / "SadTalker"   # head motion + eye blink + expressions
+MUSETALK_DIR    = ROOT / "models" / "MuseTalk"     # lip sync (runs on SadTalker output)
+
 # ── Output ────────────────────────────────────────────────────────────────────
 OUTPUT_FPS         = 25
 OUTPUT_RESOLUTION  = (1920, 1080)   # 16:9
@@ -104,22 +108,25 @@ BRAND_SCENE_MAP = {
 # ── Avatar Personas ───────────────────────────────────────────────────────────
 AVATARS = {
     "priya_telugu_f": {
-        "name": "Priya", "language": "te", "gender": "female",
-        "voice_profile": "te_female_professional",
+        "name": "Priya Sharma", "language": "te", "gender": "female",
+        "title": "Telugu Presenter",
+        "voice_profile": "priya_telugu",
         "poses": ["standing", "sitting_desk", "half_body"],
         "attires": ["professional", "traditional_saree", "casual"],
         "flux_prompt_base": "photorealistic south indian telugu woman, 30 years old, warm brown skin, dark eyes, professional appearance, sharp features, studio lighting, 8k",
     },
     "arjun_telugu_m": {
-        "name": "Arjun", "language": "te", "gender": "male",
-        "voice_profile": "te_male_professional",
+        "name": "Arjun Varma", "language": "te", "gender": "male",
+        "title": "Senior Telugu Journalist",
+        "voice_profile": "arjun_telugu",
         "poses": ["standing", "sitting_desk", "half_body"],
         "attires": ["suit", "kurta", "casual"],
         "flux_prompt_base": "photorealistic south indian telugu man, 32 years old, warm brown skin, dark hair, confident look, professional, studio lighting, 8k",
     },
     "navya_telugu_f": {
-        "name": "Navya", "language": "te", "gender": "female",
-        "voice_profile": "te_female_professional",
+        "name": "Navya Reddy", "language": "te", "gender": "female",
+        "title": "Telugu News Anchor",
+        "voice_profile": "navya_telugu",
         "poses": ["standing", "half_body"],
         "attires": ["professional", "traditional_saree", "casual"],
         "flux_prompt_base": "photorealistic south indian telugu woman, early 20s, 22 years old, warm brown skin, long dark hair, beautiful attractive hyderabad girl, sharp expressive eyes, confident smile, professional, studio lighting, 8k",

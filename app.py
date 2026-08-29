@@ -1,601 +1,590 @@
 """
-Avatar Studio — Production App (v2.0)
+app.py — Avatar Studio v3.0 — Full Production UI
 
-Full pipeline:
-  Content (Instagram/YouTube/Audio/Text)
-  → Script (llama3.1:8b, Telugu anchor style)
-  → TTS (edge-tts Microsoft Neural, primary)
-  → Lip Sync (MuseTalk, fallback: static)
-  → Compose (FFmpeg, background + lower-third + subtitles)
-  → Export (16:9 · 9:16 Reels · 1:1 Instagram)
+Tab 1: Content     → URL (Instagram/YouTube) | Audio upload | YouTube cookies.txt | Topic text
+Tab 2: Script      → LLM generation | Emotion-tagged | Review + Approve gate
+Tab 3: Avatar      → Persona | Pose | Attire | Scene | Debate speaker
+Tab 4: Generate    → Full pipeline | Progress | Download all formats
+
+Pipeline: SadTalker → MuseTalk → GFPGAN → FFmpeg compose → multi-format output
 
 Security:
-  - server_name=127.0.0.1 (Nginx proxies — never 0.0.0.0)
-  - share=False
-  - Port 7860 NEVER opened in Security Group
+  server_name="127.0.0.1"  (Nginx proxies port 80 only — never open 7860)
+  share=False
+  max_threads=2
 """
 import json
 import logging
-import sys
-import threading
+import os
+import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
 
 import gradio as gr
 from dotenv import load_dotenv
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.resolve()
-sys.path.insert(0, str(ROOT))
-load_dotenv(ROOT / ".env")
-
-from config import (
-    OUTPUTS_DIR, AVATARS_DIR, SCENES, AVATARS, LANGUAGES,
-    VIDEO_FORMATS, VOICE_PROFILES, BACKGROUNDS_DIR,
-    OLLAMA_MODEL,
-)
-from pipeline.content_engine  import process_source
-from pipeline.script_engine   import process_content as generate_script_pipeline
-from pipeline.tts_engine      import synthesize, add_room_acoustics
-from pipeline.musetalk_engine import generate_lipsync, is_available as musetalk_available
-from pipeline.video_engine    import compose_video, compose_debate, generate_thumbnail
-from pipeline.avatar_engine   import get_avatar_path
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(ROOT / "logs" / "app.log"),
-    ],
-)
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s")
 log = logging.getLogger("app")
 
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-(ROOT / "logs").mkdir(exist_ok=True)
+ROOT    = Path(__file__).parent.resolve()
+OUTPUTS = ROOT / "outputs"
+OUTPUTS.mkdir(exist_ok=True)
 
-# Generation lock — single GPU handles one job at a time
-_gen_lock = threading.Lock()
+# ── Pipeline imports ──────────────────────────────────────────────────────────
+from pipeline.content_engine  import process_source
+from pipeline.script_engine   import generate_script, generate_debate, check_script_quality, strip_emotion_tags
+from pipeline.tts_engine      import synthesize, synthesize_segmented, detect_emotion
+from pipeline.musetalk_engine import generate_lipsync, get_pipeline_status
+from pipeline.video_engine    import (
+    compose_video, export_vertical, export_square,
+    generate_thumbnail, generate_ass_subtitles,
+)
+from pipeline.avatar_engine   import load_avatar_image
 
-# ── UI option lists ───────────────────────────────────────────────────────────
-SCENE_CHOICES    = [(v["label"], k) for k, v in SCENES.items()]
-AVATAR_CHOICES   = [(f"{v['name']} ({LANGUAGES.get(v['language'], v['language'])})", k)
-                    for k, v in AVATARS.items()]
-LANG_CHOICES     = [(v, k) for k, v in LANGUAGES.items()]
-FORMAT_CHOICES   = [(v["desc"], k) for k, v in VIDEO_FORMATS.items()] + [("Auto Detect", "auto")]
-CHAR_CHOICES     = [("🎤 Navya Reddy (Telugu F, Hyderabad)", "navya"),
-                    ("🎙️ Arjun Varma (Telugu M, Vijayawada)", "arjun")]
-POSE_CHOICES     = [("Half Body — recommended", "half_body"),
-                    ("Standing Full Body", "standing"),
-                    ("Sitting at Desk", "sitting_desk")]
-ATTIRE_CHOICES   = [("Professional", "professional"), ("Suit", "suit"),
-                    ("Traditional (Saree/Kurta)", "traditional_saree"),
-                    ("Casual", "casual")]
-CAT_CHOICES      = [
-    ("Auto Detect", "general"), ("Bigg Boss / Reality TV", "bigg_boss"),
-    ("Movie Review", "movie_review"), ("Tech Review", "tech_review"),
-    ("News / Current Affairs", "general"), ("Festival / Special", "festival"),
-]
+# ── Config ────────────────────────────────────────────────────────────────────
+from config import AVATARS, SCENES
 
+# ── Pipeline status banner ────────────────────────────────────────────────────
+_STATUS = get_pipeline_status()
+_STATUS_LINES = []
+_STATUS_LINES.append("✅ SadTalker: head motion + eye blink + expressions"
+                     if _STATUS["sadtalker"] else
+                     "⚠️ SadTalker: not installed (run setup.sh) — no head motion")
+_STATUS_LINES.append("✅ MuseTalk: lip sync"
+                     if _STATUS["musetalk"] else
+                     "⚠️ MuseTalk: not installed — static avatar fallback")
+_STATUS_LINES.append("✅ GFPGAN: face quality enhancement"
+                     if _STATUS["gfpgan"] else
+                     "⚠️ GFPGAN: not installed")
+STATUS_BANNER = "\n".join(_STATUS_LINES)
 
-# ── Step 1: Extract content ───────────────────────────────────────────────────
+AVATAR_CHOICES = {
+    k: f"{v['name']} — {v['language'].upper()} {v['gender'].title()}"
+    for k, v in AVATARS.items()
+}
 
-def step_extract(
-    url: str, audio_file, topic_text: str, language: str
-) -> tuple[str, str]:
-    """
-    Extract content from Instagram Reel / YouTube / audio upload / topic text.
-    Returns (transcript, status_message)
-    """
-    audio_path = audio_file if audio_file else ""
-
-    result = process_source(
-        url=url or "",
-        audio_path=str(audio_path) if audio_path else "",
-        topic_text=topic_text or "",
-        language=language,
-    )
-
-    if result.get("error"):
-        return "", f"❌ {result['error']}"
-
-    transcript = result["transcript"]
-    platform   = result["platform"]
-    title      = result.get("title", "")
-    info = f"✅ Content extracted | Source: {platform} | {len(transcript)} chars"
-    if title:
-        info += f" | Title: {title[:60]}"
-
-    return transcript, info
+# ── Cookies path ──────────────────────────────────────────────────────────────
+COOKIES_PATH = ROOT / "models" / "yt_cookies.txt"
 
 
-# ── Step 2: Generate script ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — CONTENT EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def step_generate_script(
-    transcript: str,
-    language: str,
-    format_type: str,
-    duration: int,
-    topic: str,
-    character_id: str,
-    category: str,
-    source_url: str,
-) -> tuple[str, str, str]:
-    """
-    Generate script from transcript using llama3.1:8b.
-    Returns (script, scene_key, status)
-    """
-    if not transcript.strip():
-        return "", "professional/office", "❌ No transcript. Extract content first (Step 1)."
-
+def extract_content(url, audio_file, topic_text, language, cookies_file):
+    """Extract and transcribe content from any source."""
     try:
-        result = generate_script_pipeline(
-            source=transcript,
+        # Save cookies if uploaded
+        if cookies_file is not None:
+            COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(cookies_file.name, str(COOKIES_PATH))
+            log.info(f"Cookies saved → {COOKIES_PATH}")
+
+        # Inject cookies path into env for yt-dlp
+        if COOKIES_PATH.exists():
+            os.environ["YTDLP_COOKIES"] = str(COOKIES_PATH)
+
+        result = process_source(
+            url=url or "",
+            audio_path=audio_file.name if audio_file else "",
+            topic_text=topic_text or "",
             language=language,
-            format_type=format_type if format_type != "auto" else "auto",
-            duration_sec=duration,
-            topic=topic or "",
-            character_id=character_id,
-            topic_category=category,
-            save_to_memory=True,
         )
 
         if result.get("error"):
-            return "", "professional/office", f"❌ Script error: {result['error']}"
+            return gr.update(value=f"⚠️ {result['error']}", visible=True), "", gr.update()
 
-        script   = result["script"]
-        fmt      = result["format"]
-        scene    = result["metadata"].get("detected_scene", "professional/office")
-        entities = result["metadata"].get("entities", [])
+        transcript = result["transcript"]
+        platform   = result["platform"]
+        title      = result.get("title", "")
+        duration   = result.get("duration", 0)
 
-        status = (
-            f"✅ Script ready | Model: {OLLAMA_MODEL} | Format: {fmt} | "
-            f"Scene: {SCENES.get(scene, {}).get('label', scene)} | "
-            f"{len(script)} chars"
+        status = f"✅ Content extracted | Source: {platform}"
+        if title:
+            status += f" | {title}"
+        if duration:
+            status += f" | {int(duration)}s"
+        status += f" | {len(transcript.split())} words"
+
+        return (
+            gr.update(value=status,  visible=True),
+            transcript,
+            gr.update(interactive=True),
         )
-        if entities:
-            status += f" | Keywords: {', '.join(entities[:4])}"
-
-        return script, scene, status
 
     except Exception as e:
-        log.exception("Script generation error")
-        return "", "professional/office", f"❌ Error: {e}"
+        log.error(f"Content extraction: {e}")
+        return gr.update(value=f"❌ {e}", visible=True), "", gr.update()
 
 
-# ── Full generate pipeline ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SCRIPT GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_video(
-    approved_script: str,
-    language: str,
-    character_id: str,
-    persona_id: str,
-    pose: str,
-    attire: str,
-    scene_key: str,
-    format_type: str,
-    display_name: str,
-    display_title: str,
-    show_subtitles: bool,
-    export_vertical: bool,
-    export_square: bool,
-    persona_b_id: str,
-    attire_b: str,
-    use_parler: bool,
-    enhance_faces: bool,
-    progress=gr.Progress(),
-) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
-    """
-    Full generation pipeline. Returns (status, video_path, vertical_path, thumbnail_path).
-    """
-    if not approved_script.strip():
-        return "❌ No script. Complete Steps 1 & 2 and click Approve.", None, None, None
-
-    if not _gen_lock.acquire(blocking=False):
-        return "⏳ Another video is currently generating. Please wait...", None, None, None
-
-    job_id  = str(uuid.uuid4())[:8]
-    job_dir = OUTPUTS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+def gen_script(transcript, persona_id, duration, content_type, use_debate, persona_b_id):
+    """Generate Telugu script with emotion tags."""
+    if not transcript.strip():
+        return "⚠️ No content — go back to Tab 1 and extract content first.", "", gr.update()
 
     try:
-        log.info(f"[{job_id}] Generation start | format={format_type} char={character_id}")
-
-        # ── Step 1: Avatar ────────────────────────────────────────────────────
-        progress(0.05, desc="Loading avatar...")
-        avatar_img = get_avatar_path(persona_id, pose, attire)
-        if not avatar_img:
-            return (
-                f"❌ Avatar not found: {persona_id}/{pose}/{attire}. "
-                "Run python scripts/generate_avatars.py",
-                None, None, None,
-            )
-
-        # ── Step 2: Split script for debate ───────────────────────────────────
-        script_a = approved_script
-        script_b = ""
-        if format_type == "debate":
-            lines_a, lines_b = [], []
-            for line in approved_script.splitlines():
-                s = line.strip()
-                if s.upper().startswith(("NAVYA:", "SPEAKER_A:")):
-                    lines_a.append(re.sub(r'^(NAVYA|SPEAKER_A):\s*', '', s, flags=re.I))
-                elif s.upper().startswith(("ARJUN:", "SPEAKER_B:")):
-                    lines_b.append(re.sub(r'^(ARJUN|SPEAKER_B):\s*', '', s, flags=re.I))
-            script_a = " ".join(lines_a) if lines_a else approved_script
-            script_b = " ".join(lines_b)
-
-        # ── Step 3: TTS ───────────────────────────────────────────────────────
-        progress(0.10, desc="Generating voice (edge-tts)...")
-        voice_profile = AVATARS[persona_id]["voice_profile"]
-        audio_raw     = job_dir / "voice_raw.wav"
-        audio_final   = job_dir / "voice_final.wav"
-
-        ok = synthesize(script_a, voice_profile, audio_raw, use_parler=use_parler)
-        if not ok:
-            return "❌ TTS failed. Check logs/app.log.", None, None, None
-
-        # Room acoustics
-        scene_cfg   = SCENES.get(scene_key, {})
-        reverb_type = scene_cfg.get("reverb", "small_room")
-        add_room_acoustics(audio_raw, reverb_type, audio_final)
-        if not audio_final.exists():
-            import shutil; shutil.copy2(str(audio_raw), str(audio_final))
-
-        # ── Step 4: Lip Sync (MuseTalk) ───────────────────────────────────────
-        mt_status = "MuseTalk" if musetalk_available() else "static (MuseTalk not installed)"
-        progress(0.25, desc=f"Lip sync ({mt_status})...")
-
-        lipsync_a = job_dir / "lipsync_a.mp4"
-        ok = generate_lipsync(
-            avatar_path=Path(avatar_img),
-            audio_path=audio_final,
-            out_path=lipsync_a,
-            enhance=enhance_faces,
-        )
-        if not ok:
-            return "❌ Lip sync failed. Check logs/app.log.", None, None, None
-
-        # ── Step 5: Debate — second speaker ───────────────────────────────────
-        lipsync_b = None
-        audio_b   = None
-        if format_type == "debate" and script_b:
-            progress(0.55, desc="Generating debate Speaker B...")
-            avatar_b = get_avatar_path(persona_b_id, pose, attire_b)
-            if not avatar_b:
-                avatar_b = avatar_img
-
-            voice_b = AVATARS.get(persona_b_id, AVATARS[persona_id])["voice_profile"]
-            audio_b_raw = job_dir / "voice_b_raw.wav"
-            audio_b     = job_dir / "voice_b.wav"
-            lipsync_b   = job_dir / "lipsync_b.mp4"
-
-            synthesize(script_b, voice_b, audio_b_raw, use_parler=use_parler)
-            add_room_acoustics(audio_b_raw, reverb_type, audio_b)
-            if not audio_b.exists():
-                import shutil; shutil.copy2(str(audio_b_raw), str(audio_b))
-
-            generate_lipsync(Path(avatar_b), audio_b, lipsync_b, enhance=enhance_faces)
-
-        # ── Step 6: Compose ───────────────────────────────────────────────────
-        progress(0.75, desc="Composing final video (FFmpeg)...")
-        final_video = job_dir / f"avatar_studio_{job_id}.mp4"
-        name_out    = display_name or AVATARS[persona_id]["name"]
-        title_out   = display_title or "AI Avatar"
-
-        if format_type == "debate" and lipsync_b and audio_b:
-            name_b = AVATARS.get(persona_b_id, {}).get("name", "Speaker B")
-            ok = compose_debate(
-                lipsync_a=lipsync_a,
-                lipsync_b=lipsync_b,
-                audio_a=audio_final,
-                audio_b=audio_b,
-                name_a=name_out,
-                name_b=name_b,
-                scene_key=scene_key,
-                out_path=final_video,
+        if use_debate and persona_b_id:
+            result = generate_debate(
+                transcript=transcript,
+                persona_a_id=persona_id,
+                persona_b_id=persona_b_id,
+                duration=duration,
             )
         else:
-            ok = compose_video(
-                lipsync_video=lipsync_a,
-                audio_path=audio_final,
-                scene_key=scene_key,
-                out_path=final_video,
-                lower_third_name=name_out,
-                lower_third_title=title_out,
-                script_text=script_a,
-                language=language,
-                show_subtitles=show_subtitles,
-                export_vertical=export_vertical,
-                export_square=export_square,
+            result = generate_script(
+                transcript=transcript,
+                persona_id=persona_id,
+                duration=duration,
+                content_type=content_type,
+                add_emotion_tags=True,
             )
 
-        if not ok or not final_video.exists():
-            return "❌ Compose step failed. Check logs/app.log.", None, None, None
+        quality = check_script_quality(result["script"])
+        script_display = strip_emotion_tags(result["script"])
+        word_count = result.get("word_count", 0)
+        est_min    = result.get("estimated_duration_sec", 0) // 60
+        est_sec    = result.get("estimated_duration_sec", 0) % 60
 
-        # ── Step 7: Thumbnail ─────────────────────────────────────────────────
-        progress(0.92, desc="Generating thumbnail...")
-        thumb_path = job_dir / "thumbnail.jpg"
-        generate_thumbnail(Path(avatar_img), name_out, thumb_path)
-
-        # ── Save script text ──────────────────────────────────────────────────
-        script_file = job_dir / f"script_{job_id}.txt"
-        script_file.write_text(approved_script, encoding="utf-8")
-
-        # Vertical path (created by compose_video if export_vertical=True)
-        vert_path = final_video.with_stem(final_video.stem + "_reels")
-        vert_out  = str(vert_path) if vert_path.exists() else None
-
-        size_mb = final_video.stat().st_size // (1024 * 1024)
-        progress(1.0, desc="Done!")
-        log.info(f"[{job_id}] Complete: {final_video} ({size_mb}MB)")
-
-        status = (
-            f"✅ Video ready! | Job: {job_id} | Size: {size_mb}MB | "
-            f"Lip sync: {mt_status} | Formats: 16:9"
-            + (" + 9:16" if vert_out else "")
+        info_line = (
+            f"✅ Script ready | ~{word_count} words | "
+            f"~{est_min}m{est_sec:02d}s | "
+            f"{'⚠️ ' + ' · '.join(quality['issues']) if quality['issues'] else 'Quality OK'}"
         )
-        return status, str(final_video), vert_out, str(thumb_path) if thumb_path.exists() else None
+
+        return (
+            info_line,
+            script_display,
+            gr.update(interactive=True),   # Approve button
+        )
 
     except Exception as e:
-        log.exception(f"[{job_id}] Generation crashed")
-        return f"❌ Unexpected error: {e}\n\nSee logs/app.log", None, None, None
-    finally:
-        _gen_lock.release()
+        log.error(f"Script generation: {e}")
+        return f"❌ {e}", "", gr.update()
 
 
-# ── Gradio UI ─────────────────────────────────────────────────────────────────
+def approve_script(script_display):
+    """Mark script as approved and move to Tab 3."""
+    if not script_display.strip():
+        return "⚠️ Script is empty — generate one first.", gr.update()
+    return "✅ Script approved — proceed to Tab 3", gr.update(interactive=True)
 
-import re
 
-def build_ui() -> gr.Blocks:
-    musetalk_status = "✅ MuseTalk installed" if musetalk_available() else "⚠️ MuseTalk not installed (static fallback active)"
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    with gr.Blocks(
-        title="Avatar Studio",
-        theme=gr.themes.Base(
-            primary_hue="blue", neutral_hue="slate",
-            font=["Inter", "Noto Sans", "sans-serif"],
-        ),
-        css="""
-        body { font-family: 'Inter', sans-serif; }
-        .tab-nav button { font-size: 14px; font-weight: 600; padding: 10px 16px; }
-        .bigbtn { background: #1565c0 !important; color: white !important;
-                  font-size: 17px !important; height: 52px !important;
-                  font-weight: 700 !important; }
-        .status { font-family: monospace; font-size: 13px; }
-        .step-header { font-size: 16px; font-weight: 700; color: #1565c0;
-                       margin-bottom: 8px; }
-        .info-box { background: #f0f4ff; border-left: 3px solid #1565c0;
-                    padding: 12px; border-radius: 4px; font-size: 13px; }
-        """,
-    ) as app:
+def generate_video(
+    transcript, script_display, persona_id, pose, attire, scene,
+    debate_mode, persona_b_id,
+    use_subtitles, export_reels, export_square_fmt, use_gfpgan, use_parler,
+    language, progress=gr.Progress(track_tqdm=True),
+):
+    """Full production pipeline: TTS → lip sync → compose → multi-format."""
+    if not script_display.strip():
+        return None, None, None, "❌ No script — complete Tabs 1-3 first."
 
-        gr.Markdown(f"""
-# 🎬 Avatar Studio v2.0
-**Telugu AI Video Generator** — Instagram Reels, YouTube, Audio, Text → Professional video
-{musetalk_status} | LLM: {OLLAMA_MODEL} | TTS: edge-tts (Microsoft Neural)
-        """)
+    job_id  = str(uuid.uuid4())[:8]
+    job_dir = OUTPUTS / job_id
+    job_dir.mkdir(parents=True)
 
-        # Shared state
-        state_transcript = gr.State("")
-        state_script     = gr.State("")
-        state_scene      = gr.State("professional/office")
-        state_format     = gr.State("monologue")
+    try:
+        # ── 1. TTS ──────────────────────────────────────────────────────────
+        progress(0.05, desc="🎙️ Synthesising voice...")
+        audio_path = job_dir / "audio.wav"
 
-        with gr.Tabs():
+        # Reconstruct script with emotion tags for segmented synthesis
+        ok = synthesize_segmented(
+            text=script_display,
+            voice_profile=AVATARS[persona_id]["voice_profile"],
+            out_path=str(audio_path),
+            use_parler=use_parler,
+        )
+        if not ok:
+            return None, None, None, "❌ TTS failed. Check logs."
 
-            # ─── Tab 1: Content Source ────────────────────────────────────────
-            with gr.TabItem("1 · Content"):
-                gr.Markdown('<div class="step-header">Step 1 — Get your content</div>')
-                gr.Markdown("""
-<div class="info-box">
-📱 <b>Instagram Reels</b> work on EC2 — paste reel URL directly.<br>
-🎵 <b>YouTube</b> on EC2 is blocked — upload the MP3/audio file instead.<br>
-✍️ <b>Topic text</b> always works — type what the video should cover.
-</div>
-                """)
+        # ── 2. Load avatar image ────────────────────────────────────────────
+        progress(0.15, desc="🖼️ Loading avatar...")
+        avatar_cfg   = AVATARS[persona_id]
+        avatar_image = load_avatar_image(persona_id, pose, attire)
 
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        url_input = gr.Textbox(
-                            label="🔗 URL (Instagram Reel / YouTube)",
-                            placeholder="https://www.instagram.com/reel/... or https://youtube.com/watch?v=...",
-                            lines=2,
-                        )
-                        audio_upload = gr.Audio(
-                            label="🎵 Upload Audio (MP3/WAV — works for YouTube too)",
-                            type="filepath",
-                        )
-                        topic_input = gr.Textbox(
-                            label="✍️ Topic / Script Text (paste transcript or describe the topic)",
-                            placeholder="e.g. Google I/O 2025 announcements in Telugu — key highlights...",
-                            lines=4,
-                        )
-                    with gr.Column(scale=1):
-                        lang_input     = gr.Dropdown(LANG_CHOICES, value="te", label="Language")
-                        format_input   = gr.Dropdown(FORMAT_CHOICES, value="auto", label="Video Format")
-                        category_input = gr.Dropdown(CAT_CHOICES, value="general", label="Topic Category")
-                        duration_input = gr.Slider(30, 600, value=180, step=30,
-                                                    label="Target Duration (seconds)")
-                        topic_label    = gr.Textbox(label="Topic label (optional)",
-                                                    placeholder="e.g. Google I/O 2025")
+        # Save avatar image to job dir for reference
+        import shutil
+        saved_avatar = job_dir / "avatar.png"
+        shutil.copy2(str(avatar_image), str(saved_avatar))
 
-                extract_btn = gr.Button("📥 Extract Content", variant="secondary")
-                extract_status = gr.Textbox(label="Extraction Status", interactive=False,
-                                            elem_classes="status", lines=2)
-                transcript_box = gr.Textbox(label="Extracted Transcript (editable)",
-                                            lines=8, interactive=True)
+        # ── 3. Lip sync (SadTalker + MuseTalk + GFPGAN) ────────────────────
+        progress(0.20, desc="💋 Animating face (SadTalker + MuseTalk)...")
+        avatar_video = job_dir / "avatar_lipsync.mp4"
 
-                extract_btn.click(
-                    fn=step_extract,
-                    inputs=[url_input, audio_upload, topic_input, lang_input],
-                    outputs=[transcript_box, extract_status],
-                )
+        dominant_emotion = detect_emotion(script_display[:500])
+        generate_lipsync(
+            source_image=saved_avatar,
+            audio_path=audio_path,
+            out_path=avatar_video,
+            use_gfpgan=use_gfpgan,
+            emotion=dominant_emotion,
+        )
 
-            # ─── Tab 2: Script ────────────────────────────────────────────────
-            with gr.TabItem("2 · Script"):
-                gr.Markdown('<div class="step-header">Step 2 — Generate & review script</div>')
+        if not avatar_video.exists():
+            return None, None, None, "❌ Lip sync failed. Check models."
 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        char_input     = gr.Dropdown(CHAR_CHOICES, value="navya",
-                                                      label="Character")
-                        gr.Markdown("""**Script options:**""")
-                        with gr.Accordion("Debate settings", open=False):
-                            debate_navya = gr.Textbox(label="Navya's position",
-                                                       value="in favour")
-                            debate_arjun = gr.Textbox(label="Arjun's position",
-                                                       value="against")
+        # ── 4. Subtitles ────────────────────────────────────────────────────
+        subtitle_path = None
+        if use_subtitles:
+            progress(0.60, desc="📝 Generating subtitles...")
+            subtitle_path = job_dir / "subtitles.ass"
+            subtitle_path = generate_ass_subtitles(audio_path, subtitle_path, language)
 
-                    with gr.Column(scale=2):
-                        gen_script_btn = gr.Button("🧠 Generate Script", variant="primary")
-                        script_status = gr.Textbox(label="Status", interactive=False,
-                                                   elem_classes="status", lines=2)
+        # ── 5. Compose 16:9 ────────────────────────────────────────────────
+        progress(0.70, desc="🎬 Composing broadcast video...")
+        final_video = job_dir / f"avatar_studio_{job_id}.mp4"
 
-                script_box = gr.Textbox(
-                    label="Generated Script (edit freely before approving)",
-                    lines=18, interactive=True,
-                    placeholder="Script appears here after clicking Generate Script...",
-                )
+        compose_video(
+            avatar_video=avatar_video,
+            audio_path=audio_path,
+            out_path=final_video,
+            scene=scene,
+            persona_name=avatar_cfg["name"],
+            persona_title=avatar_cfg.get("title", "Telugu Anchor"),
+            subtitle_path=subtitle_path,
+            lower_third=True,
+            color_grade=True,
+            breathing=True,
+        )
 
-                with gr.Row():
-                    scene_detected = gr.Textbox(label="Auto-detected scene", interactive=False)
-                    approve_btn = gr.Button("✅ Approve Script → Ready to Generate",
-                                           variant="primary", elem_classes="bigbtn")
-                approve_status = gr.Textbox(label="", interactive=False)
+        if not final_video.exists():
+            return None, None, None, "❌ Video composition failed."
 
-                gen_script_btn.click(
-                    fn=step_generate_script,
-                    inputs=[transcript_box, lang_input, format_input, duration_input,
-                            topic_label, char_input, category_input, url_input],
-                    outputs=[script_box, state_scene, script_status],
-                ).then(
-                    fn=lambda scene: SCENES.get(scene, {}).get("label", scene),
-                    inputs=[state_scene],
-                    outputs=[scene_detected],
-                )
+        # ── 6. Reels export (9:16) ──────────────────────────────────────────
+        reels_video = None
+        if export_reels:
+            progress(0.85, desc="📱 Exporting Reels (9:16)...")
+            reels_path = job_dir / f"avatar_studio_{job_id}_reels.mp4"
+            if export_vertical(final_video, reels_path):
+                reels_video = str(reels_path)
 
-                approve_btn.click(
-                    fn=lambda s, fmt: (s, fmt or "monologue", "✅ Script approved. Go to Generate tab."),
-                    inputs=[script_box, format_input],
-                    outputs=[state_script, state_format, approve_status],
-                )
+        # ── 7. Square export (1:1) ──────────────────────────────────────────
+        square_video = None
+        if export_square_fmt:
+            progress(0.90, desc="⬜ Exporting square (1:1)...")
+            square_path = job_dir / f"avatar_studio_{job_id}_square.mp4"
+            if export_square(final_video, square_path):
+                square_video = str(square_path)
 
-            # ─── Tab 3: Avatar & Scene ────────────────────────────────────────
-            with gr.TabItem("3 · Avatar & Scene"):
-                gr.Markdown('<div class="step-header">Step 3 — Choose your presenter and background</div>')
+        # ── 8. Thumbnail ────────────────────────────────────────────────────
+        progress(0.95, desc="🖼️ Generating thumbnail...")
+        thumb_path = job_dir / "thumbnail.jpg"
+        generate_thumbnail(
+            avatar_image=saved_avatar,
+            title_text=script_display[:80],
+            out_path=thumb_path,
+        )
 
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("#### Primary Avatar")
-                        persona_input  = gr.Dropdown(AVATAR_CHOICES, value="navya_telugu_f",
-                                                      label="Avatar Persona")
-                        pose_input     = gr.Dropdown(POSE_CHOICES, value="half_body", label="Pose")
-                        attire_input   = gr.Dropdown(ATTIRE_CHOICES, value="professional", label="Attire")
-                        name_input     = gr.Textbox(label="Display Name (lower third)",
-                                                     placeholder="e.g. Navya Reddy")
-                        title_input    = gr.Textbox(label="Display Title",
-                                                     placeholder="e.g. AI News Anchor")
+        # ── 9. Save script ──────────────────────────────────────────────────
+        (job_dir / f"script_{job_id}.txt").write_text(script_display, encoding="utf-8")
 
-                    with gr.Column():
-                        gr.Markdown("#### Background Scene")
-                        scene_input    = gr.Dropdown(SCENE_CHOICES, value="professional/office",
-                                                      label="Background")
-                        gr.Markdown("#### Debate — Second Speaker (if debate format)")
-                        persona_b      = gr.Dropdown(AVATAR_CHOICES, value="arjun_telugu_m",
-                                                      label="Debate Speaker B")
-                        attire_b       = gr.Dropdown(ATTIRE_CHOICES, value="suit",
-                                                      label="Speaker B Attire")
+        status = (
+            f"✅ Generation complete | Job: {job_id}\n"
+            f"📁 Files saved to: outputs/{job_id}/\n"
+            f"📹 16:9 (YouTube): avatar_studio_{job_id}.mp4\n"
+        )
+        if reels_video:
+            status += f"📱 9:16 (Reels):  avatar_studio_{job_id}_reels.mp4\n"
+        if square_video:
+            status += f"⬜ 1:1 (Instagram): avatar_studio_{job_id}_square.mp4\n"
 
-                # Sync detected scene to dropdown
-                state_scene.change(
-                    fn=lambda s: gr.update(value=s),
-                    inputs=[state_scene],
-                    outputs=[scene_input],
-                )
+        progress(1.0, desc="✅ Done!")
+        return str(final_video), reels_video, square_video, status
 
-            # ─── Tab 4: Generate ──────────────────────────────────────────────
-            with gr.TabItem("4 · Generate"):
-                gr.Markdown('<div class="step-header">Step 4 — Generate video</div>')
-                gr.Markdown("""
-<div class="info-box">
-Make sure you have <b>approved the script</b> in Tab 2 before generating.
-</div>
-                """)
+    except Exception as e:
+        log.exception(f"Generation failed: {e}")
+        return None, None, None, f"❌ Generation failed: {e}"
 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("**Output options:**")
-                        show_subs_cb  = gr.Checkbox(value=True,
-                                                     label="Burn subtitles (Telugu Unicode)")
-                        export_vert_cb = gr.Checkbox(value=True,
-                                                      label="Export 9:16 (Reels/Shorts)")
-                        export_sq_cb  = gr.Checkbox(value=False,
-                                                     label="Export 1:1 (Instagram feed)")
-                        gr.Markdown("**Voice options:**")
-                        use_parler_cb = gr.Checkbox(value=False,
-                                                     label="Use Indic Parler-TTS (best quality, needs HF approval)")
-                        enhance_cb    = gr.Checkbox(value=True,
-                                                     label="GFPGAN face enhancement")
 
-                    with gr.Column(scale=2):
-                        gen_btn = gr.Button("🚀 Generate Video", variant="primary",
-                                            elem_classes="bigbtn")
-                        gen_status = gr.Textbox(label="Generation Status", lines=3,
-                                                interactive=False, elem_classes="status")
+# ═══════════════════════════════════════════════════════════════════════════════
+# GRADIO UI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-                with gr.Row():
-                    video_out    = gr.Video(label="🎬 Generated Video (16:9)", height=400)
-                    video_vert   = gr.Video(label="📱 Reels / Shorts (9:16)", height=400)
+CUSTOM_CSS = """
+#status-banner {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: #e0e0e0;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: monospace;
+    font-size: 13px;
+    border: 1px solid #2a3a5e;
+    white-space: pre-line;
+}
+.status-ok  { color: #4ade80; }
+.status-warn{ color: #fbbf24; }
+.tab-header { font-weight: 700; color: #e8920a; }
+"""
 
-                with gr.Row():
-                    thumb_out    = gr.Image(label="🖼️ Thumbnail", height=200)
+with gr.Blocks(
+    title="Avatar Studio v3.0",
+    theme=gr.themes.Base(primary_hue="orange"),
+    css=CUSTOM_CSS,
+) as demo:
 
-                gr.Markdown("""
-**Generation time on T4:**
+    # ── Header ──────────────────────────────────────────────────────────────
+    gr.Markdown("# 🎬 Avatar Studio v3.0 — Telugu AI Anchor Platform")
+    gr.Markdown(
+        f"**Pipeline:** SadTalker (head+blink) → MuseTalk (lip sync) → GFPGAN (face quality) → FFmpeg (broadcast compose)\n\n"
+        f"```\n{STATUS_BANNER}\n```"
+    )
 
-| Duration | MuseTalk installed | Static fallback |
+    # ── State ───────────────────────────────────────────────────────────────
+    state_transcript = gr.State("")
+    state_script     = gr.State("")
+
+    # ────────────────────────────────────────────────────────────────────────
+    with gr.Tabs():
+
+        # ── TAB 1: CONTENT ───────────────────────────────────────────────────
+        with gr.Tab("📥 1 · Content"):
+            gr.Markdown("### Extract content from any source")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    inp_url = gr.Textbox(
+                        label="Instagram Reel or YouTube URL",
+                        placeholder="https://www.instagram.com/reel/XXXXXXXXX/  or  https://youtu.be/XXXX",
+                    )
+                    inp_audio = gr.File(
+                        label="Upload Audio (MP3/WAV) — use this for YouTube videos downloaded on your PC",
+                        file_types=[".mp3", ".wav", ".m4a", ".ogg"],
+                    )
+                    inp_topic = gr.Textbox(
+                        label="Or type a topic / script directly",
+                        placeholder="Bigg Boss Telugu Season 8 Day 10 — eviction results and drama...",
+                        lines=4,
+                    )
+
+                with gr.Column(scale=1):
+                    inp_cookies = gr.File(
+                        label="YouTube Cookies (cookies.txt) — required for YouTube downloads on EC2",
+                        file_types=[".txt"],
+                    )
+                    gr.Markdown(
+                        "**How to get cookies.txt:**\n"
+                        "1. Install: *Get cookies.txt LOCALLY* (Chrome extension)\n"
+                        "2. Log in to youtube.com\n"
+                        "3. Click extension → Export cookies → upload here\n\n"
+                        "⚠️ Cookies expire after ~30 days — re-upload if YouTube blocks"
+                    )
+                    inp_language = gr.Dropdown(
+                        label="Content Language",
+                        choices=["te", "hi", "ta", "kn", "en"],
+                        value="te",
+                    )
+
+            btn_extract = gr.Button("🔍 Extract Content", variant="primary")
+            extract_status = gr.Textbox(label="Status", interactive=False, visible=False)
+            out_transcript  = gr.Textbox(label="Extracted Content Preview", lines=6, interactive=False)
+
+            btn_extract.click(
+                extract_content,
+                inputs=[inp_url, inp_audio, inp_topic, inp_language, inp_cookies],
+                outputs=[extract_status, out_transcript, btn_extract],
+            )
+
+        # ── TAB 2: SCRIPT ────────────────────────────────────────────────────
+        with gr.Tab("✍️ 2 · Script"):
+            gr.Markdown("### Generate & review Telugu anchor script")
+
+            with gr.Row():
+                sel_persona   = gr.Dropdown(label="Anchor", choices=list(AVATAR_CHOICES.keys()),
+                                            value=list(AVATAR_CHOICES.keys())[0])
+                sel_duration  = gr.Dropdown(label="Duration",
+                                            choices=["30s","60s","2min","3min","5min","8min","10min"],
+                                            value="3min")
+                sel_content   = gr.Dropdown(label="Content Type",
+                                            choices=["news","analysis","entertainment","educational"],
+                                            value="news")
+
+            with gr.Row():
+                chk_debate  = gr.Checkbox(label="Debate Format (two anchors)", value=False)
+                sel_persona_b = gr.Dropdown(label="Debate Speaker B",
+                                             choices=list(AVATAR_CHOICES.keys()),
+                                             visible=False)
+
+            chk_debate.change(lambda v: gr.update(visible=v), chk_debate, sel_persona_b)
+
+            btn_gen_script = gr.Button("🤖 Generate Script (llama3.1:8b)", variant="primary")
+            script_status  = gr.Textbox(label="Status", interactive=False)
+            out_script     = gr.Textbox(
+                label="Generated Script (edit if needed — emotion tags are stripped for display)",
+                lines=15, interactive=True,
+            )
+
+            with gr.Row():
+                btn_approve = gr.Button("✅ Approve Script", variant="secondary", interactive=False)
+                approve_status = gr.Textbox(label="", interactive=False, scale=3)
+
+            btn_gen_script.click(
+                gen_script,
+                inputs=[out_transcript, sel_persona, sel_duration, sel_content,
+                        chk_debate, sel_persona_b],
+                outputs=[script_status, out_script, btn_approve],
+            )
+            btn_approve.click(
+                approve_script,
+                inputs=[out_script],
+                outputs=[approve_status, btn_approve],
+            )
+
+        # ── TAB 3: AVATAR & SCENE ────────────────────────────────────────────
+        with gr.Tab("🎭 3 · Avatar & Scene"):
+            gr.Markdown("### Configure your avatar and scene")
+
+            with gr.Row():
+                with gr.Column():
+                    av_persona = gr.Dropdown(
+                        label="Avatar",
+                        choices=list(AVATAR_CHOICES.items()),
+                        value=list(AVATAR_CHOICES.keys())[0],
+                    )
+                    av_pose = gr.Radio(
+                        label="Pose",
+                        choices=["half_body", "standing"],
+                        value="half_body",
+                    )
+                    av_attire = gr.Radio(
+                        label="Attire",
+                        choices=["professional", "traditional", "casual"],
+                        value="professional",
+                    )
+
+                with gr.Column():
+                    av_scene = gr.Dropdown(
+                        label="Background Scene",
+                        choices=list(SCENES.keys()) if isinstance(list(SCENES.values())[0], str)
+                                else [k for k in SCENES],
+                        value=list(SCENES.keys())[0],
+                    )
+                    gr.Markdown(
+                        "**Scene tip:** 'studio' works for all content. "
+                        "'parliament' for political news. 'entertainment' for showbiz."
+                    )
+
+        # ── TAB 4: GENERATE ──────────────────────────────────────────────────
+        with gr.Tab("🚀 4 · Generate"):
+            gr.Markdown("### Generate your broadcast-quality video")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**Output options:**")
+                    opt_subtitles = gr.Checkbox(label="Burn subtitles (Telugu Unicode)", value=True)
+                    opt_reels     = gr.Checkbox(label="Export 9:16 Reels/Shorts version", value=True)
+                    opt_square    = gr.Checkbox(label="Export 1:1 Instagram feed version", value=False)
+                    opt_gfpgan    = gr.Checkbox(label="GFPGAN face enhancement (slower)", value=True)
+                    opt_parler    = gr.Checkbox(
+                        label="Use Indic Parler-TTS (best quality — needs HF gated access)",
+                        value=False,
+                    )
+
+            btn_generate = gr.Button(
+                "🎬 Generate Video  (1–30 min depending on duration + options)",
+                variant="primary", size="lg",
+            )
+
+            gen_status   = gr.Textbox(label="Progress", interactive=False, lines=6)
+
+            with gr.Row():
+                out_main   = gr.Video(label="📹 16:9 (YouTube/LinkedIn)")
+                out_reels  = gr.Video(label="📱 9:16 (Reels/Shorts)", visible=True)
+
+            out_square = gr.Video(label="⬜ 1:1 (Instagram feed)", visible=False)
+
+            opt_reels.change(lambda v: gr.update(visible=v), opt_reels, out_reels)
+            opt_square.change(lambda v: gr.update(visible=v), opt_square, out_square)
+
+            btn_generate.click(
+                generate_video,
+                inputs=[
+                    out_transcript,    # transcript from Tab 1
+                    out_script,        # script from Tab 2
+                    av_persona,        # from Tab 3
+                    av_pose, av_attire, av_scene,
+                    chk_debate, sel_persona_b,
+                    opt_subtitles, opt_reels, opt_square,
+                    opt_gfpgan, opt_parler,
+                    inp_language,
+                ],
+                outputs=[out_main, out_reels, out_square, gen_status],
+            )
+
+        # ── Help tab ─────────────────────────────────────────────────────────
+        with gr.Tab("ℹ️ Help"):
+            gr.Markdown("""
+## Generation Times (T4 GPU)
+
+| Duration | Full pipeline (SadTalker+MuseTalk+GFPGAN) | Without GFPGAN |
 |---|---|---|
-| 60s short | ~3 min | ~1 min |
-| 3 min KT video | ~6 min | ~2 min |
-| 8 min review | ~12 min | ~4 min |
+| 1 min | ~6 min | ~4 min |
+| 3 min | ~14 min | ~9 min |
+| 5 min | ~22 min | ~14 min |
+| 10 min | ~40 min | ~25 min |
 
-*MuseTalk runs at ~1× real-time on T4. Static = no lip sync.*
-                """)
+---
 
-                gen_btn.click(
-                    fn=generate_video,
-                    inputs=[
-                        state_script, lang_input, char_input,
-                        persona_input, pose_input, attire_input,
-                        scene_input, state_format,
-                        name_input, title_input,
-                        show_subs_cb, export_vert_cb, export_sq_cb,
-                        persona_b, attire_b,
-                        use_parler_cb, enhance_cb,
-                    ],
-                    outputs=[gen_status, video_out, video_vert, thumb_out],
-                )
+## YouTube Download on EC2
 
-    return app
+EC2 IPs are blocked by YouTube. Options:
 
+**Option A — Cookies (recommended):**
+1. Install "Get cookies.txt LOCALLY" Chrome extension
+2. Log in to youtube.com
+3. Export cookies → upload in Tab 1
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+**Option B — Download audio locally:**
+```bash
+pip install yt-dlp
+yt-dlp -x --audio-format mp3 -o "video.mp3" "YOUTUBE_URL"
+```
+Then upload the MP3 in Tab 1.
 
+**Option C — Instagram Reels:**
+Instagram works perfectly on EC2. Use Reels as your source.
+
+---
+
+## Voice Quality
+
+| Engine | When | Quality |
+|---|---|---|
+| Indic Parler-TTS | Enabled + HF access approved | ⭐⭐⭐⭐⭐ |
+| edge-tts (ShrutiNeural) | Default | ⭐⭐⭐⭐ |
+| gTTS | Fallback | ⭐⭐ |
+
+Indic Parler-TTS: request access at huggingface.co/ai4bharat/indic-parler-tts
+
+---
+
+## Security
+
+- Port 7860 never opened in AWS Security Group (Nginx proxies port 80)
+- server_name=127.0.0.1 in app.py (never 0.0.0.0)
+- share=False in Gradio
+- cookies.txt stored locally in models/yt_cookies.txt (never committed to git)
+            """)
+
+# ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting Avatar Studio v2.0...")
-    log.info(f"MuseTalk: {'available' if musetalk_available() else 'not installed (static fallback)'}")
-    log.info(f"LLM: {OLLAMA_MODEL}")
-    log.info(f"Outputs: {OUTPUTS_DIR}")
-
-    ui = build_ui()
-    ui.launch(
-        server_name="127.0.0.1",   # Nginx proxies — NEVER change to 0.0.0.0
+    from pathlib import Path
+    Path("logs").mkdir(exist_ok=True)
+    log.info(f"Pipeline: SadTalker={_STATUS['sadtalker']} MuseTalk={_STATUS['musetalk']} GFPGAN={_STATUS['gfpgan']}")
+    demo.launch(
+        server_name="127.0.0.1",  # NEVER change to 0.0.0.0 — Nginx proxies port 80
         server_port=7860,
-        share=False,               # NEVER set to True
-        show_error=True,
+        share=False,
         max_threads=2,
+        show_error=True,
     )

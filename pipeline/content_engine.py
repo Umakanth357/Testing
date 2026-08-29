@@ -2,16 +2,24 @@
 content_engine.py — Unified content extraction pipeline
 
 Supported sources (in priority order):
-  1. Audio file upload  → Whisper transcription (always works)
-  2. Instagram Reels    → yt-dlp download + Whisper (works on EC2 IPs)
-  3. YouTube URL        → transcript API attempt → guide to audio upload
-  4. Topic / text       → direct pass-through
+  1. Audio file upload      → Whisper transcription (always works)
+  2. Instagram Reels        → yt-dlp download + Whisper (works on EC2 IPs)
+  3. YouTube + cookies.txt  → yt-dlp with browser session cookies (bypasses bot block)
+  4. YouTube transcript API → caption text (no download, free, when captions exist)
+  5. Supadata.ai API        → transcript API fallback (50 free req/day)
+  6. Topic / text           → direct pass-through
 
-Instagram works on EC2 because Instagram does not block AWS IPs.
-YouTube is blocked — we guide users to upload the audio file instead.
+YouTube bot-block bypass:
+  EC2 IPs are blocked. Solutions in priority order:
+  a) Upload cookies.txt exported from Chrome (Get cookies.txt LOCALLY extension)
+     yt-dlp --cookies cookies.txt → looks like a real logged-in user session
+  b) youtube-transcript-api — gets captions directly, no download needed
+  c) Supadata.ai free API — transcript-only, 50 req/day free
+  d) Upload audio file directly (always works)
 """
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile

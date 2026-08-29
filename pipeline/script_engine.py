@@ -1,521 +1,331 @@
 """
-Script Engine — Content ingestion, copyright protection, script generation.
+script_engine.py — LLM-powered Telugu script generation with emotion tagging
 
-Pipeline:
-  YouTube URL / text → transcribe → extract facts → similarity check
-  → rewrite fresh script → detect format → split for debate if needed
+Uses llama3.1:8b via Ollama to generate anchor-style Telugu scripts from:
+  - Transcribed content (Instagram/YouTube/audio)
+  - Topic text
+  - Debate format (two speakers)
+
+Emotion tagging:
+  Each paragraph in the generated script gets an [EMOTION:xxx] tag prepended.
+  This is used by the TTS engine to match vocal delivery to content.
+  The LLM is instructed to insert these tags naturally.
+
+Tone profiles per character:
+  Navya Reddy — warm, personable, breaking news urgency when needed
+  Arjun Varma — authoritative, analytical, measured delivery
+  Priya Sharma — energetic, youthful, entertainment-forward
 """
-import re
-import json
 import logging
-import tempfile
-import subprocess
-from pathlib import Path
+import re
+import time
 from typing import Optional
 
-import httpx
 import requests
-
-from config import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, LANGUAGES, BRAND_SCENE_MAP
-from pipeline.character_bible import (
-    build_character_system_prompt, build_debate_system_prompt,
-    who_leads_topic, get_character, CHARACTERS
-)
-from pipeline.memory_db import build_script_context, format_context_for_prompt
 
 log = logging.getLogger("script_engine")
 
-# Similarity threshold — above this triggers a forced rewrite
-SIMILARITY_THRESHOLD = 0.35
+# ── Config ────────────────────────────────────────────────────────────────────
+OLLAMA_HOST    = "http://127.0.0.1:11434"
+PRIMARY_MODEL  = "llama3.1:8b"
+FALLBACK_MODEL = "gemma3:4b"
+TIMEOUT        = 180   # seconds
 
-# ── YouTube Ingestion ─────────────────────────────────────────────────────────
+# ── Character system prompts ──────────────────────────────────────────────────
+CHARACTER_PROMPTS = {
+    "navya_telugu_f": """You are Navya Reddy, a popular Telugu news anchor known for your warm,
+approachable style and ability to explain complex topics clearly.
+Your delivery is professional yet personal. You connect emotionally with the audience.
+For breaking news: urgent and clear. For feature stories: warm and engaging.
+Always write in natural spoken Telugu, not written formal Telugu.""",
 
-def download_youtube_audio(url: str, out_dir: Path) -> Optional[Path]:
-    """Download audio from YouTube URL using yt-dlp. Returns WAV path or None."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "source_audio.wav"
+    "arjun_telugu_m": """You are Arjun Varma, a senior Telugu journalist and political analyst.
+Known for authoritative, fact-driven reporting with deep analysis.
+Your delivery is measured, confident, and commands respect.
+You use precise Telugu vocabulary and structure arguments clearly.
+Write in formal but accessible Telugu suitable for educated audiences.""",
 
-    cmd = [
-        "yt-dlp", "-x", "--audio-format", "wav",
-        "--audio-quality", "0",
-        "--output", str(out_path.with_suffix("")),  # yt-dlp adds extension
-        "--no-playlist",
-        "--quiet",
-        url,
-    ]
+    "priya_telugu_f": """You are Priya Sharma, a Telugu entertainment and lifestyle presenter.
+Young, energetic, and enthusiastic. Your style is conversational and fun.
+You make content relatable to young Telugu-speaking audiences.
+Mix in trending references, keep energy high, and be expressive.
+Write in modern spoken Telugu mixed with some English when natural.""",
+}
+
+# ── Duration → word count mapping ────────────────────────────────────────────
+DURATION_WORDS = {
+    "30s":  75,
+    "60s":  150,
+    "2min": 300,
+    "3min": 450,
+    "5min": 750,
+    "8min": 1200,
+    "10min": 1500,
+}
+
+
+# ── Ollama helper ─────────────────────────────────────────────────────────────
+
+def _ollama_generate(prompt: str, model: str = PRIMARY_MODEL) -> str:
+    """Send prompt to Ollama and return generated text."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            log.error(f"yt-dlp failed: {result.stderr[:500]}")
-            return None
-        # yt-dlp may name file slightly differently
-        candidates = list(out_dir.glob("source_audio*"))
-        return candidates[0] if candidates else None
-    except subprocess.TimeoutExpired:
-        log.error("yt-dlp timed out after 300s")
-        return None
-    except FileNotFoundError:
-        log.error("yt-dlp not installed")
-        return None
-
-
-def transcribe_audio(audio_path: Path, language: str = "te") -> Optional[str]:
-    """Transcribe audio using faster-whisper. Returns full transcript text."""
-    try:
-        from faster_whisper import WhisperModel
-        model = WhisperModel("large-v3", device="auto", compute_type="float16")
-        lang_code = language if language != "en" else None  # None = auto-detect for English
-        segments, _ = model.transcribe(str(audio_path), language=lang_code, beam_size=5)
-        transcript = " ".join(seg.text.strip() for seg in segments)
-        log.info(f"Transcribed {len(transcript)} characters")
-        return transcript
-    except ImportError:
-        log.warning("faster-whisper not available, falling back to whisper")
-        return _transcribe_whisper_fallback(audio_path, language)
-    except Exception as e:
-        log.error(f"Transcription failed: {e}")
-        return None
-
-
-def _transcribe_whisper_fallback(audio_path: Path, language: str) -> Optional[str]:
-    try:
-        import whisper
-        model = whisper.load_model("large-v3")
-        result = model.transcribe(str(audio_path), language=language)
-        return result.get("text", "")
-    except Exception as e:
-        log.error(f"Whisper fallback failed: {e}")
-        return None
-
-
-# ── Copyright Protection — 3-Layer System ────────────────────────────────────
-
-def extract_facts_only(transcript: str) -> list[str]:
-    """
-    Layer 1: Strip all original sentences. Extract only facts, numbers, names.
-    Returns list of raw fact strings. All original language/structure is discarded.
-    """
-    prompt = f"""You are a fact extractor. Extract ONLY raw facts from this transcript.
-Output a JSON array of fact strings. Each fact = one discrete piece of information.
-Include: names, numbers, dates, statistics, product names, locations, events.
-DISCARD: all sentences, opinions, transitions, filler words, original structure.
-Do NOT quote or paraphrase original sentences.
-
-Transcript:
-{transcript[:4000]}
-
-Output ONLY valid JSON array, nothing else. Example: ["fact1", "fact2"]"""
-
-    response = _ollama(prompt)
-    if not response:
-        return []
-    try:
-        # Extract JSON array from response
-        match = re.search(r'\[.*\]', response, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception:
-        pass
-    # Fallback: split by newlines
-    return [line.strip("- ").strip() for line in response.splitlines() if line.strip()]
-
-
-def check_similarity(original: str, rewritten: str) -> float:
-    """
-    Layer 2: Compute semantic similarity between original transcript and rewritten script.
-    Returns 0.0 (completely different) to 1.0 (identical).
-    """
-    try:
-        from sentence_transformers import SentenceTransformer, util
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        orig_chunks = _chunk_text(original, 512)
-        new_chunks = _chunk_text(rewritten, 512)
-        orig_emb = model.encode(orig_chunks[:10], convert_to_tensor=True)
-        new_emb = model.encode(new_chunks[:10], convert_to_tensor=True)
-        scores = util.cos_sim(orig_emb, new_emb)
-        return float(scores.max().item())
-    except Exception as e:
-        log.warning(f"Similarity check failed: {e} — defaulting to 0.0 (safe)")
-        return 0.0
-
-
-def generate_script(facts: list[str], language: str, format_type: str,
-                    topic: str = "", tone: str = "professional",
-                    duration_sec: int = 180,
-                    character_id: str = "navya",
-                    topic_category: str = "general",
-                    entity_names: list[str] = None,
-                    debate_positions: dict = None) -> str:
-    """
-    Layer 3: Generate completely fresh script from facts only.
-    Character personality and memory context injected into every call.
-    New structure, new angle, new transitions — original source unrecognisable.
-    """
-    lang_name = LANGUAGES.get(language, "English")
-    word_count = int(duration_sec * 2.5)
-
-    # ── Memory context — what we've covered before ───────────────────────────
-    mem_ctx = build_script_context(topic, entity_names or [])
-    memory_block = format_context_for_prompt(mem_ctx)
-
-    # ── Character personality injection ──────────────────────────────────────
-    if format_type == "debate":
-        navya_pos  = (debate_positions or {}).get("navya", "in favour")
-        arjun_pos  = (debate_positions or {}).get("arjun", "against")
-        char_block = build_debate_system_prompt(topic, navya_pos, arjun_pos)
-        # ID-RAG style identity grounding — research confirmed LLMs drift toward
-        # social conformity without this. Each character must maintain position.
-        speaker_rule = (
-            "- Mark each speaker as NAVYA: or ARJUN: before every line\n"
-            "- NAVYA must maintain her position throughout even if Arjun makes good points\n"
-            "- ARJUN must maintain his position throughout even if Navya makes good points\n"
-            "- Characters can acknowledge a point without changing their stance\n"
-            "- They must NOT agree with each other by the end — partial mutual acknowledgment only\n"
-            "- If a character starts drifting to the other's position, reset them with internal conviction"
+        r = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=TIMEOUT,
         )
-    else:
-        char_block  = build_character_system_prompt(character_id, topic, format_type)
-        speaker_rule = ""
-
-    format_instructions = {
-        "monologue":   "Single presenter. Natural conversational flow. Use first person.",
-        "debate":      "TWO speakers: NAVYA (challenger) and ARJUN (anchor). Make it feel like a real disagreement.",
-        "news_anchor": "Professional news anchor style. Formal, authoritative. Short punchy sentences.",
-        "seminar":     "Academic/professional presentation. Well-structured with transitions. Include agenda.",
-        "short":       "Hook in first sentence. Very concise. Max 150 words total. High energy.",
-    }
-
-    agenda_instruction = ""
-    if format_type in ("monologue", "seminar", "news_anchor") and len(facts) > 3:
-        agenda_instruction = "Start with a compelling hook line, then mention 3-4 topics you'll cover."
-
-    prompt = f"""{char_block}
-
---- MEMORY / PAST EPISODES ---
-{memory_block if memory_block else "This is the first episode. No prior context."}
---- END MEMORY ---
-
-Write a complete video script in {lang_name} language.
-
-Format: {format_instructions.get(format_type, format_instructions['monologue'])}
-Tone: {tone}
-Target length: approximately {word_count} words
-Topic: {topic or 'General information'}
-{agenda_instruction}
-
-Facts to cover (use ALL in your OWN words):
-{chr(10).join(f'- {f}' for f in facts[:30])}
-
-Requirements:
-- Write in {lang_name} using the character's language mix as instructed
-- Natural speech rhythm with commas and pauses
-- Emotional transitions (excitement, gravity, curiosity)
-- Add [breath] before sentences longer than 20 words
-- Do NOT copy any original source sentences
-- Include at least one catchphrase from the character's list
-- If memory shows past coverage on this topic, reference it naturally
-- If open predictions exist on this topic, acknowledge them
-- Start with a strong hook. End with memorable closing + subscribe call
-{speaker_rule}
-
-Write the complete script now:"""
-
-    script = _ollama(prompt, temperature=0.7)
-    if not script:
-        log.error("Script generation failed")
-        return ""
-    return script.strip()
+        r.raise_for_status()
+        return r.json().get("response", "").strip()
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            "Ollama is not running. Start it with: ollama serve"
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError(
+            f"Ollama timed out after {TIMEOUT}s. Model may still be loading."
+        )
+    except Exception as e:
+        raise RuntimeError(f"Ollama error: {e}")
 
 
-def rewrite_if_similar(original_transcript: str, script: str, facts: list[str],
-                        language: str, format_type: str, topic: str) -> str:
-    """Force rewrite if script is too similar to original. Max 3 attempts."""
-    for attempt in range(3):
-        similarity = check_similarity(original_transcript, script)
-        log.info(f"Script similarity attempt {attempt+1}: {similarity:.2f}")
-        if similarity < SIMILARITY_THRESHOLD:
-            log.info("Similarity check passed")
-            return script
-        log.warning(f"Similarity {similarity:.2f} > {SIMILARITY_THRESHOLD} — rewriting")
-        script = generate_script(facts, language, format_type, topic,
-                                  tone=["energetic", "analytical", "storytelling"][attempt % 3])
-    log.info("Rewrite loop complete — returning best attempt")
-    return script
+def _generate_with_fallback(prompt: str) -> str:
+    """Try primary model, fall back to gemma3:4b."""
+    try:
+        return _ollama_generate(prompt, PRIMARY_MODEL)
+    except RuntimeError as e:
+        if "not found" in str(e).lower() or "model" in str(e).lower():
+            log.warning(f"Primary model failed: {e} — trying {FALLBACK_MODEL}")
+            return _ollama_generate(prompt, FALLBACK_MODEL)
+        raise
 
 
-# ── Format Detection ──────────────────────────────────────────────────────────
+# ── Emotion tag insertion ─────────────────────────────────────────────────────
 
-def detect_format(text: str) -> dict:
+def tag_emotions_llm(script: str) -> str:
     """
-    Analyse content and suggest best video format + scene.
-    Returns: {format, scene, reason, entities}
+    Ask the LLM to add [EMOTION:xxx] tags to each paragraph.
+    Tags: excited | professional | serious | warm | sombre | calm | energetic
     """
-    prompt = f"""Analyse this content and return a JSON object with:
-- "format": best video format (one of: monologue, debate, news_anchor, seminar, short)
-- "scene": best background scene key (examples: professional/office, nature/beach, brand/google_stage, professional/news_desk)
-- "reason": one sentence explanation
-- "entities": list of brand/place names mentioned (e.g. ["Google", "Apple", "Red Fort"])
-- "tone": overall tone (professional, casual, excited, serious)
-- "debate_topic": if debate, what is the central debate question
+    prompt = f"""You are a script editor. Read the following Telugu script and add emotion delivery tags.
+Before each paragraph, add exactly one tag from this list:
+[EMOTION:excited] — good news, achievements, celebrations
+[EMOTION:professional] — news delivery, analysis, neutral information
+[EMOTION:serious] — important news, warnings, alerts
+[EMOTION:warm] — human interest, positive stories, emotional moments
+[EMOTION:sombre] — tragedy, bad news, respectful reporting
+[EMOTION:energetic] — entertainment news, sports, exciting events
 
-Content:
-{text[:1000]}
+Rules:
+- One tag per paragraph only
+- Tags must be exactly as shown above
+- Do not add any other text or explanations
+- Keep all Telugu text exactly as-is
 
-Return ONLY valid JSON, nothing else."""
+SCRIPT:
+{script}
 
-    response = _ollama(prompt)
-    if not response:
-        return {"format": "monologue", "scene": "professional/office", "reason": "default", "entities": [], "tone": "professional", "debate_topic": ""}
+OUTPUT (script with tags added):"""
 
     try:
-        match = re.search(r'\{.*\}', response, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception:
-        pass
-    return {"format": "monologue", "scene": "professional/office", "reason": "fallback", "entities": [], "tone": "professional", "debate_topic": ""}
+        tagged = _generate_with_fallback(prompt)
+        # Validate tags are present
+        if "[EMOTION:" in tagged:
+            return tagged
+        # LLM didn't add tags — use simple heuristic fallback
+        log.warning("LLM emotion tagging returned no tags — using heuristic")
+    except Exception as e:
+        log.warning(f"Emotion tagging failed: {e} — using heuristic")
+
+    return _tag_emotions_heuristic(script)
 
 
-# ── Debate Script Splitter ────────────────────────────────────────────────────
-
-def split_debate_script(script: str) -> tuple[list[str], list[str]]:
-    """
-    Split a debate script into two speaker tracks.
-    Returns (speaker_a_lines, speaker_b_lines)
-    """
-    lines_a, lines_b = [], []
-    for line in script.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.upper().startswith("SPEAKER_A:"):
-            lines_a.append(line[len("SPEAKER_A:"):].strip())
-        elif line.upper().startswith("SPEAKER_B:"):
-            lines_b.append(line[len("SPEAKER_B:"):].strip())
-        else:
-            # Untagged line — assign alternately
-            if len(lines_a) <= len(lines_b):
-                lines_a.append(line)
-            else:
-                lines_b.append(line)
-    return lines_a, lines_b
+def _tag_emotions_heuristic(script: str) -> str:
+    """Fallback: heuristic emotion tagging by keyword scanning."""
+    from pipeline.tts_engine import detect_emotion
+    paragraphs = [p.strip() for p in script.split("\n\n") if p.strip()]
+    tagged = []
+    for p in paragraphs:
+        emotion = detect_emotion(p)
+        tagged.append(f"[EMOTION:{emotion}]\n{p}")
+    return "\n\n".join(tagged)
 
 
-# ── Scene Sequence Builder ────────────────────────────────────────────────────
-
-def build_scene_sequence(script: str, entities: list[str], default_scene: str) -> list[dict]:
-    """
-    Split script into segments, assign background per segment based on entity mentions.
-    Returns list of {text, scene} dicts.
-    """
-    # Split on paragraph breaks or topic transitions
-    paragraphs = [p.strip() for p in re.split(r'\n{2,}', script) if p.strip()]
-    if len(paragraphs) < 2:
-        # Single paragraph — no scene switching needed
-        return [{"text": script, "scene": default_scene}]
-
-    segments = []
-    for para in paragraphs:
-        scene = default_scene
-        para_lower = para.lower()
-        for keyword, scene_key in BRAND_SCENE_MAP.items():
-            if keyword in para_lower:
-                scene = scene_key
-                break
-        segments.append({"text": para, "scene": scene})
-
-    log.info(f"Built {len(segments)} scene segments")
-    return segments
+def strip_emotion_tags(script: str) -> str:
+    """Remove [EMOTION:xxx] tags from script for display."""
+    return re.sub(r"\[EMOTION:[^\]]+\]\n?", "", script).strip()
 
 
-# ── Agenda Extractor ──────────────────────────────────────────────────────────
+# ── Main script generation ────────────────────────────────────────────────────
 
-def extract_agenda(script: str) -> list[str]:
-    """Extract top-level agenda items from script for on-screen display."""
-    prompt = f"""Extract the main agenda items / topics from this script.
-Return a JSON array of 3-5 short topic titles (max 5 words each).
-These will appear as on-screen agenda items.
-
-Script:
-{script[:2000]}
-
-Return ONLY a JSON array. Example: ["AI Tools Update", "Market News", "Product Review"]"""
-
-    response = _ollama(prompt)
-    if not response:
-        return []
-    try:
-        match = re.search(r'\[.*\]', response, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception:
-        pass
-    return []
-
-
-# ── Full Pipeline ─────────────────────────────────────────────────────────────
-
-def process_content(
-    source: str,              # YouTube URL or raw text
+def generate_script(
+    transcript: str,
+    persona_id: str,
+    duration: str = "3min",
     language: str = "te",
-    format_type: str = "auto",
-    duration_sec: int = 180,
-    topic: str = "",
-    work_dir: Optional[Path] = None,
-    character_id: str = "navya",
-    topic_category: str = "general",
-    debate_positions: dict = None,
-    save_to_memory: bool = True,
+    content_type: str = "news",    # 'news' | 'analysis' | 'entertainment' | 'educational'
+    add_emotion_tags: bool = True,
 ) -> dict:
     """
-    Full pipeline: source → approved script ready for TTS.
-    Returns dict with: script, format, scene_sequence, agenda, debate_parts, metadata
-    """
-    if work_dir is None:
-        work_dir = Path(tempfile.mkdtemp(prefix="avatarjob_"))
+    Generate a Telugu anchor script from source transcript.
 
-    result = {
-        "script": "", "format": format_type, "scene_sequence": [],
-        "agenda": [], "debate_parts": None, "metadata": {},
-        "error": None,
-    }
-
-    # ── Step 1: Get raw text ──────────────────────────────────────────────────
-    original_transcript = ""
-    if source.startswith("http"):
-        log.info(f"Downloading YouTube: {source}")
-        audio_path = download_youtube_audio(source, work_dir / "audio")
-        if not audio_path:
-            result["error"] = "Failed to download YouTube audio. Check URL and yt-dlp installation."
-            return result
-        original_transcript = transcribe_audio(audio_path, language)
-        if not original_transcript:
-            result["error"] = "Transcription failed. Check Whisper installation and audio quality."
-            return result
-        log.info(f"Transcribed: {len(original_transcript)} chars")
-    else:
-        original_transcript = source
-
-    # ── Step 2: Detect format if auto ────────────────────────────────────────
-    detected = detect_format(original_transcript)
-    if format_type == "auto":
-        format_type = detected.get("format", "monologue")
-        result["format"] = format_type
-    default_scene = detected.get("scene", "professional/office")
-    entities = detected.get("entities", [])
-    result["metadata"] = {
-        "detected_format": detected.get("format"),
-        "detected_scene": default_scene,
-        "tone": detected.get("tone", "professional"),
-        "entities": entities,
-        "debate_topic": detected.get("debate_topic", ""),
-        "original_length": len(original_transcript),
-    }
-
-    # ── Step 3: Extract facts (copyright layer 1) ─────────────────────────────
-    log.info("Extracting facts from transcript...")
-    facts = extract_facts_only(original_transcript)
-    if not facts:
-        log.warning("No facts extracted — using full transcript as base")
-        facts = [s.strip() for s in original_transcript.split('. ') if s.strip()][:30]
-
-    # ── Step 4: Generate fresh script (with character + memory) ─────────────
-    log.info(f"Generating {format_type} script in {language} for {character_id}...")
-    script = generate_script(
-        facts, language, format_type, topic,
-        tone              = detected.get("tone", "professional"),
-        duration_sec      = duration_sec,
-        character_id      = character_id,
-        topic_category    = topic_category,
-        entity_names      = entities,
-        debate_positions  = debate_positions,
-    )
-    if not script:
-        result["error"] = "Script generation failed. Check Ollama is running."
-        return result
-
-    # ── Step 5: Similarity check + rewrite if needed (copyright layer 2) ─────
-    if source.startswith("http"):
-        script = rewrite_if_similar(original_transcript, script, facts, language, format_type, topic)
-
-    result["script"] = script
-
-    # ── Step 6: Build scene sequence ─────────────────────────────────────────
-    result["scene_sequence"] = build_scene_sequence(script, entities, default_scene)
-
-    # ── Step 7: Extract agenda ────────────────────────────────────────────────
-    result["agenda"] = extract_agenda(script)
-
-    # ── Step 8: Split debate if needed ────────────────────────────────────────
-    if format_type == "debate":
-        lines_a, lines_b = split_debate_script(script)
-        result["debate_parts"] = {
-            "speaker_a": " ".join(lines_a),
-            "speaker_b": " ".join(lines_b),
+    Returns:
+        {
+            script: str (with emotion tags if add_emotion_tags=True),
+            script_clean: str (without tags, for display),
+            word_count: int,
+            estimated_duration_sec: int,
+            emotion_map: list of {text, emotion},
         }
+    """
+    target_words  = DURATION_WORDS.get(duration, 450)
+    char_prompt   = CHARACTER_PROMPTS.get(persona_id, CHARACTER_PROMPTS["navya_telugu_f"])
+    persona_name  = persona_id.replace("_telugu_f", "").replace("_telugu_m", "").replace("_", " ").title()
 
-    # ── Step 9: Save to content memory ───────────────────────────────────────
-    if save_to_memory and result["script"]:
-        try:
-            from pipeline.memory_db import (
-                save_episode, get_or_create_entity, link_entity_to_episode, log_episode_format
-            )
-            # Generate a 2-sentence summary for memory
-            summary_prompt = f"Summarise this script in 2 sentences max:\n{result['script'][:500]}"
-            summary = _ollama(summary_prompt, temperature=0.3) or topic
-
-            ep_id = save_episode(
-                title          = topic or f"{format_type} episode",
-                topic_category = topic_category,
-                format_type    = format_type,
-                summary        = summary[:300],
-                youtube_url    = source if source.startswith("http") else None,
-                duration_sec   = duration_sec,
-            )
-            # Track entities
-            for ent_name in entities[:10]:
-                ent_id = get_or_create_entity(ent_name, "entity")
-                link_entity_to_episode(ep_id, ent_id)
-
-            log_episode_format(ep_id, format_type, default_scene, character_id,
-                               "arjun" if format_type == "debate" else None)
-            result["episode_id"] = ep_id
-            log.info(f"Saved episode {ep_id} to content memory")
-        except Exception as e:
-            log.warning(f"Memory save failed (non-blocking): {e}")
-
-    log.info("Script pipeline complete")
-    return result
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _ollama(prompt: str, temperature: float = 0.3) -> Optional[str]:
-    """Call local Ollama with retry."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": 2048},
+    # Content-type specific instructions
+    CONTENT_TYPE_HINTS = {
+        "news":          "This is a news report. Be factual, clear, and authoritative.",
+        "analysis":      "This is a news analysis. Provide context, background, and your perspective.",
+        "entertainment": "This is entertainment news. Keep it fun, engaging, and relatable.",
+        "educational":   "This is an educational explainer. Break down complex topics simply.",
     }
-    for attempt in range(3):
-        try:
-            resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip()
-        except Exception as e:
-            log.warning(f"Ollama attempt {attempt+1} failed: {e}")
-    return None
+    content_hint = CONTENT_TYPE_HINTS.get(content_type, CONTENT_TYPE_HINTS["news"])
+
+    prompt = f"""{char_prompt}
+
+{content_hint}
+
+Your task: Rewrite the following content as a professional Telugu video script for {persona_name}.
+
+Requirements:
+- Write in natural spoken Telugu (not written/formal Telugu)
+- Target length: approximately {target_words} words
+- Structure: Opening hook → Main content (3-4 points) → Closing call-to-action
+- Opening: Grab attention in first 2 sentences
+- Use paragraph breaks between major points
+- Closing: End with a memorable line and "likes, shares, subscribe" call
+- Do NOT include stage directions, timestamps, or speaker labels
+- Write ONLY the script text that will be spoken
+
+SOURCE CONTENT:
+{transcript[:3000]}
+
+TELUGU SCRIPT:"""
+
+    log.info(f"Generating script | persona={persona_id} duration={duration} target={target_words}w")
+    start = time.time()
+    script = _generate_with_fallback(prompt)
+    elapsed = time.time() - start
+    log.info(f"Script generated in {elapsed:.1f}s | {len(script.split())} words")
+
+    # Add emotion tags
+    if add_emotion_tags:
+        script_tagged = tag_emotions_llm(script)
+    else:
+        script_tagged = script
+
+    script_clean = strip_emotion_tags(script_tagged)
+    word_count   = len(script_clean.split())
+    # Telugu speech rate: ~130 words/min
+    est_duration = int((word_count / 130) * 60)
+
+    # Build emotion map
+    emotion_map = []
+    for para in script_tagged.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        m = re.match(r"\[EMOTION:([^\]]+)\]", para)
+        emotion  = m.group(1) if m else "professional"
+        text     = re.sub(r"\[EMOTION:[^\]]+\]\n?", "", para).strip()
+        if text:
+            emotion_map.append({"text": text, "emotion": emotion})
+
+    return {
+        "script":               script_tagged,
+        "script_clean":         script_clean,
+        "word_count":           word_count,
+        "estimated_duration_sec": est_duration,
+        "emotion_map":          emotion_map,
+    }
 
 
-def _chunk_text(text: str, max_chars: int) -> list[str]:
-    words = text.split()
-    chunks, current = [], []
-    for w in words:
-        current.append(w)
-        if len(" ".join(current)) >= max_chars:
-            chunks.append(" ".join(current))
-            current = []
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
+# ── Debate script generation ──────────────────────────────────────────────────
+
+def generate_debate(
+    transcript: str,
+    persona_a_id: str,
+    persona_b_id: str,
+    duration: str = "5min",
+    topic_override: str = "",
+) -> dict:
+    """
+    Generate a debate-style script between two anchors.
+    Returns dict with 'script' containing alternating speaker lines.
+    """
+    target_words = DURATION_WORDS.get(duration, 750)
+    name_a = persona_a_id.replace("_telugu_f","").replace("_telugu_m","").replace("_"," ").title()
+    name_b = persona_b_id.replace("_telugu_f","").replace("_telugu_m","").replace("_"," ").title()
+
+    topic = topic_override or transcript[:500]
+
+    prompt = f"""Write a Telugu debate-style dialogue between two news anchors discussing:
+
+TOPIC: {topic}
+
+{name_a}: Opens, presents one perspective (3-4 sentences)
+{name_b}: Responds with a different viewpoint (3-4 sentences)
+{name_a}: Counters with evidence (3-4 sentences)
+{name_b}: Makes a strong point (3-4 sentences)
+{name_a}: Summarizes and closes (2-3 sentences)
+
+Rules:
+- Write in natural spoken Telugu
+- Target: {target_words} words total
+- Format: Start each line with the speaker's name followed by colon
+- No stage directions, just dialogue
+- Make it engaging and substantive
+
+DIALOGUE:"""
+
+    script = _generate_with_fallback(prompt)
+    script_clean = strip_emotion_tags(script)
+
+    return {
+        "script":       script,
+        "script_clean": script_clean,
+        "word_count":   len(script_clean.split()),
+        "format":       "debate",
+        "speakers":     [persona_a_id, persona_b_id],
+    }
+
+
+# ── Script quality check ──────────────────────────────────────────────────────
+
+def check_script_quality(script: str) -> dict:
+    """
+    Basic quality checks on generated script.
+    Returns dict with {passed, issues, word_count, has_telugu}.
+    """
+    clean   = strip_emotion_tags(script)
+    words   = clean.split()
+    issues  = []
+
+    if len(words) < 50:
+        issues.append("Script too short — less than 50 words")
+
+    # Check for Telugu characters
+    has_telugu = bool(re.search(r"[ఀ-౿]", clean))
+    if not has_telugu:
+        issues.append("No Telugu characters found — script may be in wrong language")
+
+    # Check for stage directions that leaked through
+    if re.search(r"\(pause\)|\[fade\]|ANCHOR:", clean, re.I):
+        issues.append("Stage directions found in script — clean before TTS")
+
+    return {
+        "passed":      len(issues) == 0,
+        "issues":      issues,
+        "word_count":  len(words),
+        "has_telugu":  has_telugu,
+        "est_duration_sec": int((len(words) / 130) * 60),
+    }
