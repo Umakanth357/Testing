@@ -1,12 +1,19 @@
 """
-app.py — Avatar Studio v3.0 — Full Production UI
+app.py — Avatar Studio v4.0 — Full Production UI
 
-Tab 1: Content     → URL (Instagram/YouTube) | Audio upload | YouTube cookies.txt | Topic text
-Tab 2: Script      → LLM generation | Emotion-tagged | Review + Approve gate
-Tab 3: Avatar      → Persona | Pose | Attire | Scene | Debate speaker
-Tab 4: Generate    → Full pipeline | Progress | Download all formats
+Tab 0: Motion Library → Paste 2-5 YouTube URLs of Telugu presenters → build motion library
+Tab 1: Content        → URL (Instagram/YouTube) | Audio upload | cookies.txt | Topic text
+Tab 2: Script         → LLM generation | Emotion-tagged | Review + Approve gate
+Tab 3: Avatar         → Persona | Pose | Attire | Scene | Debate speaker
+Tab 4: Generate       → Full pipeline | Progress | Download all formats
 
-Pipeline: SadTalker → MuseTalk → GFPGAN → FFmpeg compose → multi-format output
+Pipeline: LivePortrait (real human motion) → MuseTalk → GFPGAN → FFmpeg compose
+
+Security:
+  server_name="127.0.0.1"  (Nginx proxies port 80 only — never open 7860)
+  share=False
+  max_threads=2
+"""
 
 Security:
   server_name="127.0.0.1"  (Nginx proxies port 80 only — never open 7860)
@@ -36,6 +43,7 @@ from pipeline.content_engine  import process_source
 from pipeline.script_engine   import generate_script, generate_debate, check_script_quality, strip_emotion_tags
 from pipeline.tts_engine      import synthesize, synthesize_segmented, detect_emotion
 from pipeline.musetalk_engine import generate_lipsync, get_pipeline_status
+from pipeline.motion_library  import build_library, get_library_status
 from pipeline.video_engine    import (
     compose_video, export_vertical, export_square,
     generate_thumbnail, generate_ass_subtitles,
@@ -47,10 +55,16 @@ from config import AVATARS, SCENES
 
 # ── Pipeline status banner ────────────────────────────────────────────────────
 _STATUS = get_pipeline_status()
+_LIB_STATUS = get_library_status()
 _STATUS_LINES = []
-_STATUS_LINES.append("✅ SadTalker: head motion + eye blink + expressions"
-                     if _STATUS["sadtalker"] else
-                     "⚠️ SadTalker: not installed (run setup.sh) — no head motion")
+_STATUS_LINES.append(
+    f"✅ Motion Library: {_LIB_STATUS['total']} clips ready (real Telugu presenter motion)"
+    if _LIB_STATUS["partial"] else
+    "⚠️ Motion Library: EMPTY — go to Tab 0 and paste Telugu presenter YouTube URLs"
+)
+_STATUS_LINES.append("✅ LivePortrait: motion transfer engine"
+                     if _STATUS["liveportrait"] else
+                     "⚠️ LivePortrait: not installed (run setup.sh)")
 _STATUS_LINES.append("✅ MuseTalk: lip sync"
                      if _STATUS["musetalk"] else
                      "⚠️ MuseTalk: not installed — static avatar fallback")
@@ -334,9 +348,9 @@ with gr.Blocks(
 ) as demo:
 
     # ── Header ──────────────────────────────────────────────────────────────
-    gr.Markdown("# 🎬 Avatar Studio v3.0 — Telugu AI Anchor Platform")
+    gr.Markdown("# 🎬 Avatar Studio v4.0 — Telugu AI Anchor Platform")
     gr.Markdown(
-        f"**Pipeline:** SadTalker (head+blink) → MuseTalk (lip sync) → GFPGAN (face quality) → FFmpeg (broadcast compose)\n\n"
+        f"**Pipeline:** Real Telugu Presenter Motion → LivePortrait → MuseTalk → GFPGAN → Broadcast Compose\n\n"
         f"```\n{STATUS_BANNER}\n```"
     )
 
@@ -344,8 +358,90 @@ with gr.Blocks(
     state_transcript = gr.State("")
     state_script     = gr.State("")
 
+    # ── Motion Library build function ───────────────────────────────────────
+    def build_motion_library(url1, url2, url3, url4, url5):
+        urls = [u for u in [url1, url2, url3, url4, url5] if u and u.strip()]
+        if not urls:
+            return "❌ Paste at least one YouTube URL of a Telugu presenter."
+
+        messages = []
+        def progress(msg):
+            messages.append(msg)
+
+        try:
+            status = build_library(urls, progress_callback=progress)
+            summary = "\n".join(messages[-20:])  # last 20 lines
+            summary += f"\n\n✅ Library ready: {status['total']} clips total"
+            for emotion in ["professional", "excited", "serious", "warm", "energetic", "sombre"]:
+                summary += f"\n  {emotion}: {status[emotion]} clips"
+            if not status["ready"]:
+                summary += "\n\n⚠️ Some emotions have < 2 clips. Add more videos for full coverage."
+            return summary
+        except Exception as e:
+            return f"❌ Error: {e}"
+
+    def refresh_library_status():
+        s = get_library_status()
+        if not s["partial"]:
+            return "⚠️ Library empty — paste YouTube URLs above and click Build."
+        lines = [f"✅ Motion library: {s['total']} clips"]
+        for emotion in ["professional", "excited", "serious", "warm", "energetic", "sombre"]:
+            icon = "✅" if s[emotion] >= 2 else "⚠️"
+            lines.append(f"  {icon} {emotion}: {s[emotion]} clips")
+        return "\n".join(lines)
+
     # ────────────────────────────────────────────────────────────────────────
     with gr.Tabs():
+
+        # ── TAB 0: MOTION LIBRARY ────────────────────────────────────────────
+        with gr.Tab("🎭 0 · Motion Library"):
+            gr.Markdown("""### Build your motion library from real Telugu presenters
+
+**This is the core of the system.** You give us 2-5 YouTube videos of real
+South Indian presenters/anchors. We extract their motion (head movement, eye
+contact, expressions) and store it. Every video you generate will use this
+real human motion — making Navya move exactly like a real Telugu anchor.
+
+**What to paste:** Any YouTube video of a Telugu/South Indian person talking:
+- Telugu news anchors (TV9, NTV, ABN, ETV)
+- Telugu YouTube presenters, vloggers
+- South Indian performers (like the Vennala FM video you showed)
+- TEDx Telugu talks
+- Any person with natural, expressive Telugu presentation style
+
+**Note:** Need cookies.txt in Tab 1 if EC2 blocks YouTube downloads.
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    ml_url1 = gr.Textbox(label="YouTube URL 1 (Telugu presenter)", placeholder="https://www.youtube.com/watch?v=...")
+                    ml_url2 = gr.Textbox(label="YouTube URL 2", placeholder="https://www.youtube.com/watch?v=...")
+                    ml_url3 = gr.Textbox(label="YouTube URL 3", placeholder="https://www.youtube.com/watch?v=...")
+                with gr.Column():
+                    ml_url4 = gr.Textbox(label="YouTube URL 4 (optional)", placeholder="https://www.youtube.com/watch?v=...")
+                    ml_url5 = gr.Textbox(label="YouTube URL 5 (optional)", placeholder="https://www.youtube.com/watch?v=...")
+                    gr.Markdown("""
+**What the system extracts per video:**
+- 10-15 second clips of natural talking
+- Auto-classified by emotion:
+  professional, excited, serious, warm, energetic, sombre
+- Only front-facing, clear-face clips kept
+- Stored in models/motion_library/
+
+**Do this once.** Library persists forever.
+You can add more videos anytime to improve variety.
+                    """)
+
+            btn_build_library = gr.Button("🏗️ Build Motion Library (downloads + extracts clips)", variant="primary", size="lg")
+            library_output    = gr.Textbox(label="Build Progress", lines=20, interactive=False)
+            btn_refresh       = gr.Button("🔄 Refresh Status")
+
+            btn_build_library.click(
+                build_motion_library,
+                inputs=[ml_url1, ml_url2, ml_url3, ml_url4, ml_url5],
+                outputs=[library_output],
+            )
+            btn_refresh.click(refresh_library_status, outputs=[library_output])
 
         # ── TAB 1: CONTENT ───────────────────────────────────────────────────
         with gr.Tab("📥 1 · Content"):

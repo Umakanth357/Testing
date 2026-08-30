@@ -182,7 +182,54 @@ utils_path.write_text(txt)
 print(f"  {'PATCHED' if patched else 'already patched'}: {utils_path}")
 PYEOF
 
-# ── 10. SadTalker (head motion + eye blink + expressions) ────────────────────
+# ── 10. LivePortrait (motion transfer — PRIMARY engine) ──────────────────────
+# LivePortrait by Kuaishou — Apache 2.0 license
+# Transfers motion from real driving video to avatar source image.
+# Replaces SadTalker as primary motion engine — CATEGORICALLY better because
+# motion comes from real humans in our motion library, not estimated from audio.
+info "[10/12] Installing LivePortrait..."
+mkdir -p models
+
+if [ ! -d "models/LivePortrait" ]; then
+    info "Cloning LivePortrait..."
+    git clone --depth=1 https://github.com/KwaiVision/LivePortrait.git models/LivePortrait
+fi
+
+if [ -f "models/LivePortrait/requirements.txt" ]; then
+    info "Installing LivePortrait requirements..."
+    pip install -r models/LivePortrait/requirements.txt --quiet 2>/dev/null || \
+        warn "Some LivePortrait deps failed — non-blocking"
+fi
+check_numpy
+
+info "Downloading LivePortrait weights (~1.3GB)..."
+python3 - <<'PYEOF'
+import os
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+token = os.environ.get("HF_TOKEN")
+weights_dir = Path("models/LivePortrait/pretrained_weights")
+weights_dir.mkdir(parents=True, exist_ok=True)
+
+try:
+    snapshot_download(
+        "KwaiVision/LivePortrait",
+        local_dir=str(weights_dir),
+        token=token,
+        ignore_patterns=["*.git*"],
+    )
+    print("  OK: LivePortrait weights")
+except Exception as e:
+    print(f"  WARN: LivePortrait weights — {e}")
+PYEOF
+
+# ── SadTalker (fallback — if motion library empty) ────────────────────────────
+# SadTalker by OpenTalker (CVPR 2023) — MIT license
+# Used as FALLBACK only when motion library has no clips.
+# Primary engine is now LivePortrait with real motion library.
+info "Installing SadTalker (fallback motion engine)..."
+# ── 10b. SadTalker (head motion + eye blink + expressions) ────────────────────
 # SadTalker by OpenTalker (CVPR 2023) — MIT license
 # audio-driven: head pose + expression + eye blink from speech audio
 # ~700MB weights, ~8 min generation time for 10 min video
